@@ -458,7 +458,7 @@ def load_parts() -> pd.DataFrame:
     df["asm_qty"] = pd.to_numeric(df["asm_qty"], errors="coerce").fillna(1).astype(int)
     df["unit"] = df["sub_assembly"].where(df["sub_assembly"] != "", df["assembly_mark"])
     df["paint_req"] = df["painting_req"].str.upper().isin(["YES", "Y"])
-    # Welded? = NO: a single piece (purlin, plain beam, angle) - no fit-up/welding
+    # Welded? = NO: fitted up but not welded (purlin, plain beam, angle) - skips welding
     df["weld_req"] = df["welded"].fillna("").astype(str).str.strip().str.upper() != "NO"
     df["in_scope"] = df["scope"].str.upper() != "NO"
     return df
@@ -478,7 +478,7 @@ def load_progress() -> pd.DataFrame:
 
 def route(paint_req: bool, weld_req: bool) -> list[str]:
     """The stages a sub assembly goes through, in order."""
-    return ((["fitup", "welding"] if weld_req else []) + (["paint"] if paint_req else [])
+    return (["fitup"] + (["welding"] if weld_req else []) + (["paint"] if paint_req else [])
             + ["site"])
 
 
@@ -534,7 +534,7 @@ def units_df(asof: str | None = None) -> pd.DataFrame:
     wr = u["weld_req"]
     lv = pd.Series(0, index=u.index)
     lv = lv.mask(sum(u[f"d_{s}"] for s in STAGES) > 0, 1)
-    lv = lv.mask(wr & full("fitup"), 2)
+    lv = lv.mask(full("fitup"), 2)
     lv = lv.mask(wr & full("fitup") & full("welding"), 3)
     lv = lv.mask(full("fitup") & full("welding") & full("paint"), 4)
     lv = lv.mask(full("site"), 5)
@@ -547,7 +547,7 @@ def applies(u: pd.DataFrame, s: str) -> pd.Series:
     """Does each row (sub assembly or part) need stage s?"""
     if s == "paint":
         return u["paint_req"]
-    if s in ("fitup", "welding"):
+    if s == "welding":
         return u["weld_req"]
     return pd.Series(True, index=u.index)
 
@@ -791,8 +791,8 @@ def page_update() -> None:
     u = u[u["in_scope"]]
     u = _filters(u, "up")
     u = u[u[f"av_{s}"] > 0]
-    prereq = {"fitup": " (Welded? = YES)", "welding": " (fit-up done)",
-              "paint": " (Painting status = Yes; welded first unless Welded? = NO)",
+    prereq = {"fitup": "", "welding": " (fit-up done, Welded? = YES)",
+              "paint": " (Painting status = Yes; fit-up done, and welded unless Welded? = NO)",
               "site": " (finished every stage it needs)"}[s]
     st.caption(f"Sub assemblies with copies ready for **{cfg['label'].lower()}**{prereq}: "
                f"**{len(u):,}** · {int(u[f'av_{s}'].sum()):,} pieces · "

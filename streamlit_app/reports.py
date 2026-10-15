@@ -10,7 +10,7 @@ Master database layout = the 'Progress' sheet of MASTER DATABASE 722-1.xlsx
                   (B132-1..10)        -> asm_qty = TOTAL / block weight, stored
                   on every part row = copies of that row's sub assembly
     NAEC Scope    NO = not fabricated by NAEC (kept, left out of progress)
-    Welded?       NO = a single piece (purlin, plain beam): no fit-up / welding
+    Welded?       NO = fitted up but not welded (purlin, plain beam): skips welding
     Painting status  Yes = must be blasted & painted before site
 """
 
@@ -162,7 +162,7 @@ def parse_master(file) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
         t = p[["work_order", "assembly_mark", "unit"]].assign(
             done=per.where(has, 0), date=d,
             do_no=raw[DO_HEAD].map(_clean_text) if s == "site" else None,
-            applies=paint if s == "paint" else weld if s in ("fitup", "welding") else True)
+            applies=paint if s == "paint" else weld if s == "welding" else True)
         t = t[t["applies"]]
         for k, gg in t.groupby(["work_order", "assembly_mark", "unit"], dropna=False):
             n = int(gg["done"].min())             # every part of the unit must be there
@@ -195,7 +195,8 @@ def _backfill(prog: pd.DataFrame, p: pd.DataFrame, paint: pd.Series,
             for r in prog.itertuples()}
     extra = []
     for (wo, am, un), r in unit_req.iterrows():
-        chain = (["fitup", "welding"] if r["_w"] else []) + (["paint"] if r["_p"] else []) + ["site"]
+        chain = (["fitup"] + (["welding"] if r["_w"] else []) + (["paint"] if r["_p"] else [])
+                 + ["site"])
         top = 0
         for s in reversed(chain):
             top = max(top, have.get((wo, am, un, s), 0))
