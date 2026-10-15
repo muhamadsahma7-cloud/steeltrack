@@ -749,7 +749,8 @@ def page_overview() -> None:
             st.markdown(f"<div class='st-stage'>{cfg['label']}</div>", unsafe_allow_html=True)
             st.altair_chart(dark_alt(donut(dn, scope, tok(f"st_{s}"))),
                             use_container_width=True)
-            st.metric("Done", t_(dn), f"balance {t_(scope - dn)}", delta_color="off")
+            done_lbl = "Sent to site" if s == "site" else f"{cfg['label']} done"
+            st.metric(done_lbl, t_(dn), f"balance {t_(scope - dn)}", delta_color="off")
             st.caption(f"Last 7 days **{wk / 1000:,.2f} t**" if scope
                        else "No parts need this stage.")
 
