@@ -838,7 +838,7 @@ def _overview_today(asof: date, dated: pd.DataFrame) -> None:
     for col, (s, cfg) in zip(cols, STAGES.items()):
         x = day[day["stage"] == s]
         with col.container(key=f"td_{s}"):
-            st.metric(cfg["label"], f"{x['kg'].sum():,.1f} kg",
+            st.metric(cfg["label"], t_(x["kg"].sum()),
                       f"{int(x['qty'].sum()):,} pcs · {x.groupby(UK).ngroups:,} sub assemblies",
                       delta_color="off")
     if day.empty:
