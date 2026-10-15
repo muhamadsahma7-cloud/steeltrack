@@ -163,6 +163,11 @@ div[data-testid="stAlert"]{border-radius:10px}
 [data-testid="stProgress"] [role="progressbar"] div:empty{background:var(--accent2)}
 hr{margin:1rem 0;border-color:var(--line)}
 body:not(:has(.vega-embed)) #vg-tooltip-element{display:none!important}
+.st-sow{background:var(--panel);border:1px solid var(--line);border-left:4px solid var(--accent);
+  border-radius:12px;padding:14px 18px;margin:0 0 1.1rem}
+.st-sow-h{font-size:.78rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase;
+  color:var(--accent);margin-bottom:.35rem}
+.st-sow-b{white-space:pre-wrap;color:var(--text);line-height:1.55;font-size:.95rem}
 .st-stage{font-size:.78rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase;
   margin-bottom:.25rem}
 """
@@ -675,6 +680,13 @@ def _filters(u: pd.DataFrame, key: str, *, search: bool = True) -> pd.DataFrame:
 # --------------------------------------------------------------- Overview
 def page_overview() -> None:
     st.header("Project dashboard")
+    sow = (SETTINGS.get("scope_of_work") or "").strip()
+    if sow:
+        st.markdown(
+            "<div class='st-sow'><div class='st-sow-h'>Scope of work</div>"
+            f"<div class='st-sow-b'>{html.escape(sow)}</div></div>", unsafe_allow_html=True)
+    elif is_admin():
+        st.caption("Tip: add the project's scope of work in Data admin → Project settings.")
     if _no_data_hint():
         return
     c1, _ = st.columns([1, 3])
@@ -1257,8 +1269,15 @@ def page_admin() -> None:
         with st.form("proj"):
             name = st.text_input("Project name (shown in the sidebar, login and reports)",
                                  value=PROJECT)
+            scope = st.text_area(
+                "Scope of work (shown on the Overview page)",
+                value=SETTINGS.get("scope_of_work", ""), height=220,
+                placeholder="e.g. Fabrication, blasting & painting and delivery to site of "
+                            "the CLS structure and lower roof steelwork. "
+                            "One item per line works well.")
             if st.form_submit_button("Save"):
-                db.set_settings({"project_name": name.strip()}, _now_ts())
+                db.set_settings({"project_name": name.strip(),
+                                 "scope_of_work": scope.strip()}, _now_ts())
                 st.rerun()
 
 

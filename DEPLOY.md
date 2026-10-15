@@ -66,7 +66,8 @@ git push -u origin main
 2. **Data admin → Import master database** → upload the latest master Excel (e.g. `MASTER DATABASE 20261015.xlsx`)
    (sheet **Progress**) → *Replace everything* → Import.
    (1,653 rows, 259 sub-assemblies, 725 pieces, NAEC scope 149.28 t.)
-3. **Data admin → Project settings** → enter the project name.
+3. **Data admin → Project settings** → enter the project name and the scope of work
+   (shown at the top of the Overview page).
 4. **Users** → add your team. Access options:
    - no tokens = view only (Overview, Assemblies, Reports)
    - `Update Fit-Up`, `Update Welding`, `Update Painting`, `Update Site Delivery`
