@@ -714,10 +714,7 @@ def page_overview() -> None:
         k[3].metric("Not NAEC scope", t_(out["total_kg"].sum()),
                     f"{len(out):,} sub assemblies · not counted", delta_color="off")
 
-    _overview_today(asof, dated)
-    _overview_work_orders(u)
-
-    st.subheader("Progress by stage")
+    st.subheader("Overall progress")
     week0 = (asof - timedelta(days=6)).isoformat()
     cols = st.columns(4)
     for col, (s, cfg) in zip(cols, STAGES.items()):
@@ -734,6 +731,9 @@ def page_overview() -> None:
             st.progress(min(pct / 100, 1.0))
             st.caption(f"Last 7 days **{wk / 1000:,.2f} t**" if scope
                        else "No parts need this stage.")
+
+    _overview_today(asof, dated)
+    _overview_work_orders(u)
 
     st.subheader("Assembly status")
     stat = u.groupby(["work_order", "assembly_mark"])["level"].apply(group_status)
