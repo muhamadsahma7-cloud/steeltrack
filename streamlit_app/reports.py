@@ -4,6 +4,8 @@ Master database layout = the 'Progress' sheet of MASTER DATABASE 722-1.xlsx
 (26 columns, one row per part of ONE copy of an assembly):
 
     WEIGHT        weight of one piece      -> row weight = No. x WEIGHT
+    No. of Set    how many identical sets of the sub assembly are made (copies);
+                  when empty, worked out from TOTAL WEIGHT as below
     TOTAL WEIGHT  heads a block of rows (down to the next TOTAL WEIGHT):
                   block weight x number of identical copies. A block is one
                   sub assembly (RFT6-1) or a whole assembly listed sub by sub
@@ -28,7 +30,8 @@ from openpyxl.utils import get_column_letter
 HEADERS = [
     ("Work order no", "work_order"), ("Priority no", "priority"), ("NAEC Scope", "scope"),
     ("Welded?", "welded"), ("Area", "area"), ("Assembly Mark", "assembly_mark"), ("Sub Assembly", "sub_assembly"),
-    ("Part Mark", "part_mark"), ("No.", "qty"), ("Name", "name"), ("Profile", "profile"),
+    ("Part Mark", "part_mark"), ("No.", "qty"), ("No. of Set", "asm_qty"), ("Name", "name"),
+    ("Profile", "profile"),
     ("MATERIAL", "grade"), ("Length (Mm)", "length_mm"), ("AREA", "surface_area"),
     ("WEIGHT", "unit_weight"), ("TOTAL WEIGHT", "total_weight"),
     ("Painting status", "painting_req"), ("Remark", "remark"),
@@ -79,6 +82,8 @@ def _map_headers(cols) -> dict[str, str]:
     """sheet header -> canonical header. 'Area' (zone) and 'AREA' (surface
     m2) differ only by case, so AREA in capitals is matched exactly first."""
     canon = {h.lower(): h for h in ALL_HEADERS}
+    canon.update({"no. of sets": "No. of Set", "no of set": "No. of Set",
+                  "no of sets": "No. of Set"})
     out = {}
     for c in cols:
         s = " ".join(str(c).split())
@@ -116,11 +121,13 @@ def parse_master(file) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
         p[c] = pd.to_numeric(p[c], errors="coerce")
     p["unit_weight"] = p["unit_weight"].fillna(0.0)
     p["weight_kg"] = p["qty"].astype(float) * p["unit_weight"]
+    sets = pd.to_numeric(p.pop("asm_qty"), errors="coerce").round()
     p["scope"] = p["scope"].fillna("YES").str.upper()
     p["welded"] = p["welded"].fillna("YES").str.upper()      # older sheets have no Welded?
     p["unit"] = p["sub_assembly"].fillna(p["assembly_mark"])
 
-    # copies = TOTAL WEIGHT / weight of the block of rows it heads
+    # copies from TOTAL WEIGHT = TOTAL / weight of the block of rows it heads
+    # (used when No. of Set is empty, and to cross-check it)
     warn: list[str] = []
     p["_blk"] = (p["total_weight"].notna()
                  | p["assembly_mark"].ne(p["assembly_mark"].shift())).cumsum()
@@ -131,19 +138,31 @@ def parse_master(file) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
     g["asm_qty"] = q.fillna(1).clip(lower=1).astype(int)
     off = g[(g["tw"].notna()) & (g["copy"] > 0)
             & ((g["tw"] - g["copy"] * g["asm_qty"]).abs() > 0.05 * g["tw"])]
-    for _, r in off.iterrows():
+    p["_set"] = sets.where(sets > 0)
+    has_set = p.groupby("_blk")["_set"].transform(lambda x: x.notna().all())
+    for b, r in off.iterrows():
+        if has_set[p["_blk"] == b].all():
+            continue                       # No. of Set given: TOTAL WEIGHT not used
         who = r["first"] if r["first"] == r["last"] else f"{r['first']} … {r['last']}"
         warn.append(f"{who} (WO {r['wo']}): TOTAL WEIGHT {r['tw']:,.1f} kg is not a whole "
                     f"multiple of its parts ({r['copy']:,.1f} kg); "
                     f"taken as {int(r['asm_qty'])} cop{'y' if r['asm_qty'] == 1 else 'ies'}.")
-    p["asm_qty"] = p["_blk"].map(g["asm_qty"])
-    p = p.drop(columns=["_blk"])
-    # one sub assembly must have one copy count
-    mixed = p.groupby(["work_order", "assembly_mark", "unit"])["asm_qty"].nunique()
+    p["_tw_q"] = p["_blk"].map(g["asm_qty"])
+    uk = ["work_order", "assembly_mark", "unit"]
+    p["_tw_q"] = p.groupby(uk)["_tw_q"].transform("max")
+    # No. of Set wins; one sub assembly must have one set count
+    mixed = p.groupby(uk)["_set"].nunique()
     for k in mixed[mixed > 1].index:
-        warn.append(f"Sub assembly {k[2]} (WO {k[0]}) spans TOTAL WEIGHT blocks with "
-                    "different copy counts; the highest is used.")
-    p["asm_qty"] = p.groupby(["work_order", "assembly_mark", "unit"])["asm_qty"].transform("max")
+        warn.append(f"Sub assembly {k[2]} (WO {k[0]}) has different No. of Set on its rows; "
+                    "the highest is used.")
+    p["_set"] = p.groupby(uk)["_set"].transform("max")
+    p["asm_qty"] = p["_set"].fillna(p["_tw_q"]).astype(int)
+    dis = p[p["_set"].notna() & p["total_weight"].notna() & (p["_set"] != p["_tw_q"])]
+    for _, r in dis.drop_duplicates(uk).iterrows():
+        warn.append(f"{r['unit']} (WO {r['work_order']}): No. of Set = {int(r['_set'])}, but "
+                    f"TOTAL WEIGHT {r['total_weight']:,.1f} kg works out to {int(r['_tw_q'])}. "
+                    f"Using {int(r['_set'])} — check which is right.")
+    p = p.drop(columns=["_blk", "_set", "_tw_q"])
 
     # progress already recorded in the sheet -> one booking per unit + stage
     paint = p["painting_req"].fillna("").str.upper().isin(["YES", "Y"])

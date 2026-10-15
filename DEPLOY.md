@@ -78,6 +78,8 @@ git push -u origin main
 - The Excel layout is the **Progress** sheet of `MASTER DATABASE 20261015.xlsx` (27 columns;
   older files without `Welded?` still import, as all welded).
   `WEIGHT` = one piece; row weight = `No.` × `WEIGHT`.
+- `No. of Set` = how many of each sub-assembly to make (the copies). When it's empty, the
+  copies are worked out from TOTAL WEIGHT, as below; the import lists any row where the two disagree.
 - `TOTAL WEIGHT` heads a block of rows: block weight × number of identical copies.
   So A5 (0.9 kg, TOTAL 8.1) is made **9 times**; B132-1…10 (TOTAL 287) once each.
   The import screen lists any `TOTAL WEIGHT` that doesn't divide evenly (TTR22 now).

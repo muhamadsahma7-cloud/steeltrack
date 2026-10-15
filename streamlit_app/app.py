@@ -1118,9 +1118,8 @@ def page_reports() -> None:
                                file_name=f"DO_{pick}.xlsx", key="do_xlsx")
 
     with t3:
-        st.write("Download the whole database in the same layout as "
-                 "`MASTER DATABASE 722-1.xlsx` (sheet *Progress*). Stage kg = row weight × "
-                 "pieces done; date = last booking.")
+        st.write("Download the whole database in the same layout as the master Excel "
+                 "(sheet *Progress*). Stage kg = row weight × pieces done; date = last booking.")
         if st.button("Prepare Excel file", key="mx_prep"):
             st.session_state["mx_bytes"] = reports.master_xlsx(_export_frame(u))
         if st.session_state.get("mx_bytes"):
@@ -1165,8 +1164,9 @@ def page_admin() -> None:
     st.header("Data admin")
     t1, t2, t3 = st.tabs(["Import master database", "Backups", "Project settings"])
     with t1:
-        st.write("Upload the master database Excel (same layout as "
-                 "`MASTER DATABASE 722-1.xlsx`, sheet **Progress**).")
+        st.write("Upload the master database Excel (sheet **Progress**). "
+                 "**No. of Set** = how many of each sub assembly to make; when it's empty "
+                 "the app works it out from TOTAL WEIGHT.")
         up = st.file_uploader("Excel file", type=["xlsx", "xlsm"], key="imp_file")
         if up is not None:
             try:
@@ -1198,6 +1198,18 @@ def page_admin() -> None:
                 if len(prog):
                     st.dataframe(prog, use_container_width=True, hide_index=True)
             existing = len(load_parts())
+            if existing:
+                # sets lowered below what is already booked -> shows over 100%
+                cur = units_df()
+                cur["booked"] = cur[[f"d_{x}" for x in STAGES]].max(axis=1)
+                nq = un["q"].rename("new").reset_index()
+                chk = cur[UK + ["copies", "booked"]].merge(nq, on=UK, how="inner")
+                low = chk[chk["new"] < chk["booked"]]
+                if not low.empty:
+                    st.error("No. of Set in this file is lower than the pieces already booked "
+                             "for: " + ", ".join(f"{r.unit} ({r.booked} booked, file says "
+                                                 f"{r.new})" for r in low.itertuples())
+                             + ". Fix the file, or remove those bookings first (Update progress → Undo).")
             mode = st.radio(
                 "Import mode", ["merge", "replace"],
                 format_func=lambda m: {
