@@ -836,7 +836,7 @@ def _overview_work_orders(u: pd.DataFrame) -> None:
     iss["fit_bal"] = (iss["copies"] - iss["d_fitup"]).clip(lower=0)
     iss["weld_bal"] = (iss["copies"] - iss["d_welding"]).clip(lower=0)
     iss["backlog"] = (iss["d_fitup"] - iss["d_welding"]).clip(lower=0).where(iss["weld_req"], 0)
-    for c in ("fit_bal", "weld_bal", "backlog", "d_fitup", "d_welding", "d_site"):
+    for c in ("fit_bal", "weld_bal", "backlog"):
         iss[f"{c}_kg"] = iss[c] * iss["copy_kg"]
     n_wo = iss["work_order"].nunique()
     sub = f"{n_wo:,} WO{'s' if n_wo != 1 else ''} · {int(iss['copies'].sum()):,} pcs"
@@ -854,19 +854,6 @@ def _overview_work_orders(u: pd.DataFrame) -> None:
     ):
         with col.container(key=key):
             st.metric(label, val, d, delta_color="off")
-    g = iss.groupby("work_order").agg(
-        area=("area", lambda x: ", ".join(dict.fromkeys(v for v in x if v))),
-        subs=("unit", "size"), pcs=("copies", "sum"), kg=("total_kg", "sum"),
-        fu=("d_fitup_kg", "sum"), fb=("fit_bal_kg", "sum"), wd=("d_welding_kg", "sum"),
-        wb=("weld_bal_kg", "sum"), bl=("backlog_kg", "sum"), si=("d_site_kg", "sum"))
-    g = g.reset_index()
-    for c in ("kg", "fu", "fb", "wd", "wb", "bl", "si"):
-        g[c] = g[c] / 1000
-    show_table(g.rename(columns={
-        "work_order": "WO", "area": "Area", "subs": "Sub assemblies", "pcs": "Pieces",
-        "kg": "Weight (t)", "fu": "Fitted up (t)", "fb": "Balance fit-up (t)",
-        "wd": "Welded (t)", "wb": "Balance welding (t)", "bl": "Welding backlog (t)",
-        "si": "Sent to site (t)"}), "work_orders")
 
 
 # --------------------------------------------------------------- Update
