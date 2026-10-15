@@ -28,8 +28,8 @@ url = "postgresql+psycopg2://postgres.abcdxyz:PASSWORD@aws-0-ap-southeast-1.pool
 ```
 
 Double-click `run.bat`. The browser opens on the login page.
-(Right now it points to a local test file, `steeltrack_local.db`, which already
-holds the data from `master_database_final.xlsx`.)
+(To test without Supabase, use `url = "sqlite:///steeltrack_local.db"`. That file
+already holds the data from `MASTER DATABASE 722-1.xlsx`.)
 
 ## 3. Put the code on GitHub
 
@@ -63,8 +63,9 @@ git push -u origin main
 
 1. Sign in as **admin** / **admin123**. Change the password straight away
    (sidebar → Change password).
-2. **Data admin → Import master database** → upload `master_database_final.xlsx`
-   → *Replace everything* → Import. (4,670 parts, 486 assemblies, 342.96 t.)
+2. **Data admin → Import master database** → upload `MASTER DATABASE 722-1.xlsx`
+   (sheet **Progress**) → *Replace everything* → Import.
+   (1,653 rows, 259 sub-assemblies, 725 pieces, NAEC scope 149.28 t.)
 3. **Data admin → Project settings** → enter the project name.
 4. **Users** → add your team. Access options:
    - no tokens = view only (Overview, Assemblies, Reports)
@@ -74,15 +75,25 @@ git push -u origin main
 
 ## How progress works
 
-- Progress is booked per **sub assembly**, in order:
-  **Fit-up → Welding → Blasting & painting (D.O. No.) → Send to site (D.O. No.)**.
-  A part that doesn't need painting goes straight from welding to site.
-- A stage's kg = the part weight once that stage has a date (same as the Excel).
-- **Update progress**: pick the stage, filter, tick sub-assemblies (or *Select all
-  shown*), set the date (and D.O.), then Confirm. Mistakes: use *Undo* at the bottom.
-- **Reports → Export master database** gives back the same 25-column Excel.
+- The Excel layout is the **Progress** sheet of `MASTER DATABASE 722-1.xlsx` (26 columns).
+  `WEIGHT` = one piece; row weight = `No.` × `WEIGHT`.
+- `TOTAL WEIGHT` heads a block of rows: block weight × number of identical copies.
+  So A5 (0.9 kg, TOTAL 8.1) is made **9 times**; B132-1…10 (TOTAL 287) once each.
+  The import screen lists any `TOTAL WEIGHT` that doesn't divide evenly (TTR22 now).
+- Progress is booked as **pieces per sub-assembly**:
+  **Fit-up → Welding → Blasting & painting → Send to site (D.O. No.)**.
+  Each stage can only take pieces the previous stage has finished.
+- `Painting status` = **Yes** must be painted before site; **No** goes welding → site.
+- `NAEC Scope` = **NO** stays in the list but is not counted in progress or tonnage.
+- A stage's kg = pieces done × weight of one copy.
+- **Update progress**: pick the stage, filter, type pieces in the **Book** column
+  (or tick *Book all available*), set the date (and D.O. for site), then Confirm.
+  Mistakes: *Undo* at the bottom (remove the later stage's booking first).
+- Sent-to-site dates in the Excel without fit-up/welding dates are taken as
+  fit-up/welding done too (no date), so totals add up.
+- **Reports → Export master database** gives back the same 26-column Excel.
 - Re-importing a newer Excel with *Add new parts & update details* keeps every
-  date already booked in the app. A backup copy is made before every import
+  booking made in the app. A backup is made before every import
   (Data admin → Backups).
 
 ## Updating the app later

@@ -1,12 +1,15 @@
 """SteelTrack - steel structure fabrication progress, online.
 
 Sister app of Team Piping: same sign-in, look and layout, built around the
-steel master database (master_database_final.xlsx). Progress is booked per
-SUB ASSEMBLY through four stages:
+steel master database (MASTER DATABASE 722-1.xlsx, sheet Progress).
+Progress is booked as PIECES per SUB ASSEMBLY (a sub assembly can be made
+many times over) through four stages:
 
-    Fit-up -> Welding -> Blasting & painting (D.O.) -> Send to site (D.O.)
+    Fit-up -> Welding -> Blasting & painting (only if Painting status = Yes)
+           -> Send to site (D.O.)
 
-A stage's kg is the part weight once that stage has a date.
+A stage's kg = pieces done x weight of one copy. NAEC Scope = NO rows are
+kept but left out of progress.
 
 Run locally:
     cd streamlit_app
@@ -363,14 +366,10 @@ welcome_splash()
 # ---- access control -------------------------------------------------
 # user_credentials.permission = 'all' or a comma-separated list of tokens
 STAGES = {
-    "fitup":   dict(label="Fit-up", date="fitup_date", by="fitup_by", do=None,
-                    token="Update Fit-Up"),
-    "welding": dict(label="Welding", date="welding_date", by="welding_by", do=None,
-                    token="Update Welding"),
-    "paint":   dict(label="Blasting & painting", date="paint_date", by="paint_by",
-                    do="paint_do", token="Update Painting"),
-    "site":    dict(label="Send to site", date="site_date", by="site_by", do="site_do",
-                    token="Update Site Delivery"),
+    "fitup":   dict(label="Fit-up", token="Update Fit-Up", do=False),
+    "welding": dict(label="Welding", token="Update Welding", do=False),
+    "paint":   dict(label="Blasting & painting", token="Update Painting", do=False),
+    "site":    dict(label="Send to site", token="Update Site Delivery", do=True),
 }
 KNOWN_TOKENS = [s["token"] for s in STAGES.values()]
 ADMIN = "__admin__"
@@ -441,105 +440,136 @@ with st.sidebar:
 
 
 # --------------------------------------------------------------- data
+UK = ["work_order", "assembly_mark", "unit"]        # a sub assembly (progress unit)
+LEVELS = ["Not started", "In progress", "Fit-up done", "Welded", "Ready for site", "At site"]
+
+
 @st.cache_data(ttl=30, show_spinner=False)
 def load_parts() -> pd.DataFrame:
     df = db.query("SELECT * FROM parts ORDER BY id", ttl=0)
-    for c in ("work_order", "assembly_mark", "sub_assembly", "part_mark", "name", "profile",
-              "grade", "painting_req", "remark", "profile2",
-              "fitup_date", "welding_date", "paint_date", "site_date", "paint_do", "site_do",
-              "fitup_by", "welding_by", "paint_by", "site_by"):
+    for c in ("work_order", "scope", "area", "assembly_mark", "sub_assembly", "part_mark",
+              "name", "profile", "grade", "painting_req", "remark"):
         df[c] = df[c].fillna("").astype(str).str.strip()
-    for c in ("weight_kg", "kg_per_m", "length_mm"):
+    for c in ("weight_kg", "unit_weight", "length_mm", "surface_area", "total_weight"):
         df[c] = pd.to_numeric(df[c], errors="coerce").astype(float)
     df["weight_kg"] = df["weight_kg"].fillna(0.0)
     df["priority"] = pd.to_numeric(df["priority"], errors="coerce").astype("Int64")
-    df["qty"] = pd.to_numeric(df["qty"], errors="coerce").astype("Int64")
-    for s in STAGES.values():
-        df[s["date"]] = df[s["date"]].str[:10]
+    df["qty"] = pd.to_numeric(df["qty"], errors="coerce").fillna(1).astype(int)
+    df["asm_qty"] = pd.to_numeric(df["asm_qty"], errors="coerce").fillna(1).astype(int)
     df["unit"] = df["sub_assembly"].where(df["sub_assembly"] != "", df["assembly_mark"])
-    df["paint_req"] = df["painting_req"].str.upper().eq("YES")
+    df["paint_req"] = df["painting_req"].str.upper().isin(["YES", "Y"])
+    df["in_scope"] = df["scope"].str.upper() != "NO"
     return df
 
 
-# the same unit key the UPDATE statements match on
-_UNIT_SQL = ("coalesce(work_order,'') = :wo AND assembly_mark = :am "
-             "AND coalesce(nullif(trim(sub_assembly),''), assembly_mark) = :unit")
+@st.cache_data(ttl=30, show_spinner=False)
+def load_progress() -> pd.DataFrame:
+    df = db.query("""SELECT id, work_order, assembly_mark, unit, stage, qty, date, do_no,
+                            done_by, username, ts FROM progress ORDER BY id""", ttl=0)
+    for c in ("work_order", "assembly_mark", "unit", "stage", "date", "do_no", "done_by",
+              "username", "ts"):
+        df[c] = df[c].fillna("").astype(str).str.strip()
+    df["date"] = df["date"].str[:10]
+    df["qty"] = pd.to_numeric(df["qty"], errors="coerce").fillna(0).astype(int)
+    return df
 
 
-def done(df: pd.DataFrame, s: str, asof: str | None = None) -> pd.Series:
-    d = df[STAGES[s]["date"]]
-    m = d != ""
-    return m & (d <= asof) if asof else m
+def prev_stage(s: str, paint_req: bool) -> str | None:
+    return {"fitup": None, "welding": "fitup", "paint": "welding",
+            "site": "paint" if paint_req else "welding"}[s]
 
 
-def applies(df: pd.DataFrame, s: str) -> pd.Series:
-    return df["paint_req"] if s == "paint" else pd.Series(True, index=df.index)
+def next_stage(s: str, paint_req: bool) -> str | None:
+    return {"fitup": "welding", "welding": "paint" if paint_req else "site",
+            "paint": "site", "site": None}[s]
 
 
-def prev_done(df: pd.DataFrame, s: str) -> pd.Series:
-    if s == "fitup":
-        return pd.Series(True, index=df.index)
-    if s == "welding":
-        return done(df, "fitup")
-    if s == "paint":
-        return done(df, "welding")
-    return done(df, "paint").where(df["paint_req"], done(df, "welding"))
+def units_df(asof: str | None = None) -> pd.DataFrame:
+    """One row per sub assembly: copies, weight, and copies done per stage
+    (as of the end of `asof` when given; undated Excel bookings always count)."""
+    p = load_parts()
+    if p.empty:
+        return pd.DataFrame()
+    heavy = p.sort_values("weight_kg", ascending=False).drop_duplicates(UK).set_index(UK)
+    u = p.groupby(UK, sort=False).agg(
+        priority=("priority", "min"), area=("area", "first"), in_scope=("in_scope", "all"),
+        paint_req=("paint_req", "any"), parts=("part_mark", "size"), pcs=("qty", "sum"),
+        copy_kg=("weight_kg", "sum"), copies=("asm_qty", "max"))
+    u["main"] = (heavy["name"] + " " + heavy["profile"]).reindex(u.index)
+    u["total_kg"] = u["copy_kg"] * u["copies"]
+    g = load_progress()
+    if asof:
+        g = g[(g["date"] == "") | (g["date"] <= asof)]
+    done = g.groupby(UK + ["stage"])["qty"].sum().unstack("stage")
+    last = g[g["date"] != ""].groupby(UK + ["stage"])["date"].max().unstack("stage")
+    for s in STAGES:
+        u[f"d_{s}"] = (done[s].reindex(u.index) if s in done else pd.Series(0, index=u.index)
+                       ).fillna(0).astype(int)
+        u[f"last_{s}"] = (last[s].reindex(u.index) if s in last else pd.Series("", index=u.index)
+                          ).fillna("")
+    u.loc[~u["paint_req"], "d_paint"] = 0
+    for s in STAGES:
+        pv = prev_stage(s, False)
+        prev = u["copies"] if pv is None else u[f"d_{pv}"]
+        if s == "site":
+            prev = u["d_paint"].where(u["paint_req"], u["d_welding"])
+        u[f"av_{s}"] = (prev - u[f"d_{s}"]).clip(lower=0)
+        if s == "paint":
+            u.loc[~u["paint_req"], "av_paint"] = 0
+    full = lambda s: u[f"d_{s}"] >= u["copies"]
+    lv = pd.Series(0, index=u.index)
+    lv = lv.mask(sum(u[f"d_{s}"] for s in STAGES) > 0, 1)
+    lv = lv.mask(full("fitup"), 2)
+    lv = lv.mask(full("fitup") & full("welding"), 3)
+    lv = lv.mask((lv == 3) & (full("paint") | ~u["paint_req"]), 4)
+    lv = lv.mask(full("site"), 5)
+    u["level"] = lv
+    u["status"] = lv.map(dict(enumerate(LEVELS)))
+    return u.reset_index()
 
 
-def ready(df: pd.DataFrame, s: str) -> pd.Series:
-    return applies(df, s) & ~done(df, s) & prev_done(df, s)
-
-
-# SQL twins of applies()/prev_done(): an UPDATE only touches parts that
-# are really due, even if the page data is a few seconds stale
-_PREV_SQL = {
-    "fitup": "1=1",
-    "welding": "coalesce(fitup_date,'') <> ''",
-    "paint": ("upper(coalesce(painting_req,'')) = 'YES' "
-              "AND coalesce(welding_date,'') <> ''"),
-    "site": ("(CASE WHEN upper(coalesce(painting_req,'')) = 'YES' "
-             "THEN coalesce(paint_date,'') ELSE coalesce(welding_date,'') END) <> ''"),
-}
-_NEXT_SQL = {     # clearing a stage is blocked while a later stage is booked
-    "fitup": "coalesce(welding_date,'') = ''",
-    "welding": "coalesce(paint_date,'') = '' AND coalesce(site_date,'') = ''",
-    "paint": "coalesce(site_date,'') = ''",
-    "site": "1=1",
-}
-
-LEVELS = ["Not started", "In progress", "Fit-up done", "Welded", "Painted / ready", "At site"]
-
-
-def part_level(df: pd.DataFrame) -> pd.Series:
-    lv = pd.Series(0, index=df.index)
-    lv = lv.mask(done(df, "fitup"), 1)
-    lv = lv.mask(done(df, "fitup") & done(df, "welding"), 2)
-    lv = lv.mask((lv == 2) & (done(df, "paint") | ~df["paint_req"]), 3)
-    lv = lv.mask(done(df, "site"), 4)
-    return lv
+def applies(u: pd.DataFrame, s: str) -> pd.Series:
+    return u["paint_req"] if s == "paint" else pd.Series(True, index=u.index)
 
 
 def group_status(lv: pd.Series) -> str:
     lo, hi = int(lv.min()), int(lv.max())
-    if lo == 0:
-        return LEVELS[1] if hi > 0 else LEVELS[0]
-    return LEVELS[lo + 1]
+    return LEVELS[1] if lo == 0 and hi > 0 else LEVELS[lo]
 
 
-def stage_pcts(df: pd.DataFrame, by: list[str]) -> pd.DataFrame:
-    """weight + % complete per stage, grouped by `by`."""
-    t = df.assign(_w=df["weight_kg"])
+def events(u: pd.DataFrame) -> pd.DataFrame:
+    """progress bookings with their weight (copies x one-copy weight)."""
+    g = load_progress()
+    e = g.merge(u[UK + ["copy_kg", "in_scope", "area", "priority"]], on=UK, how="inner")
+    e = e[e["in_scope"]]
+    e["kg"] = e["qty"] * e["copy_kg"]
+    e["label"] = e["stage"].map({k: v["label"] for k, v in STAGES.items()})
+    return e
+
+
+def part_frame(u: pd.DataFrame) -> pd.DataFrame:
+    """parts carrying their sub assembly's copies + copies done per stage."""
+    cols = UK + ["copies", "paint_req"] + [f"d_{s}" for s in STAGES]
+    p = load_parts().drop(columns=["paint_req"]).merge(u[cols], on=UK, how="inner")
+    return p
+
+
+def stage_pcts(p: pd.DataFrame, by: list[str]) -> pd.DataFrame:
+    """weight + % complete per stage, grouped by `by` (p = part_frame)."""
+    t = p.assign(_w=p["weight_kg"] * p["copies"])
+    agg = {"Parts": ("weight_kg", "size"), "Weight (kg)": ("_w", "sum")}
     for s in STAGES:
-        t[f"_a_{s}"] = t["weight_kg"].where(applies(t, s), 0.0)
-        t[f"_d_{s}"] = t["weight_kg"].where(applies(t, s) & done(t, s), 0.0)
-    g = t.groupby(by, dropna=False).agg(
-        **{"parts": ("weight_kg", "size"), "weight_kg": ("_w", "sum")},
-        **{f"_a_{s}": (f"_a_{s}", "sum") for s in STAGES},
-        **{f"_d_{s}": (f"_d_{s}", "sum") for s in STAGES})
+        ap = t["paint_req"] if s == "paint" else pd.Series(True, index=t.index)
+        t[f"_a_{s}"] = t["_w"].where(ap, 0.0)
+        t[f"_d_{s}"] = (t["weight_kg"] * t[f"d_{s}"]).where(ap, 0.0)
+        agg[f"_a_{s}"] = (f"_a_{s}", "sum")
+        agg[f"_d_{s}"] = (f"_d_{s}", "sum")
+    g = t.groupby(by, dropna=False).agg(**agg)
     for s, cfg in STAGES.items():
-        g[cfg["label"] + " %"] = (g[f"_d_{s}"] / g[f"_a_{s}"].where(g[f"_a_{s}"] > 0) * 100).fillna(0)
-    g = g.drop(columns=[c for c in g.columns if c.startswith("_")]).reset_index()
-    return g.rename(columns={"parts": "Parts", "weight_kg": "Weight (kg)"})
+        # blank (not 0%) where nothing in the group needs this stage
+        g[cfg["label"] + " %"] = (g[f"_d_{s}"] / g[f"_a_{s}"].where(g[f"_a_{s}"] > 0) * 100
+                                  ).clip(upper=100)
+    return g.drop(columns=[c for c in g.columns if c.startswith("_")]).reset_index()
 
 
 PCT_COLS = [s["label"] + " %" for s in STAGES.values()]
@@ -569,12 +599,35 @@ def _refresh() -> None:
 
 
 def _no_data_hint() -> bool:
-    df = load_parts()
-    if df.empty:
+    if load_parts().empty:
         st.info("No parts loaded yet. An admin can import the master database "
                 "Excel in **Data admin**.")
         return True
     return False
+
+
+def _filters(u: pd.DataFrame, key: str, *, search: bool = True) -> pd.DataFrame:
+    """Work order / area / priority / search filters, shared by the pages."""
+    c = st.columns([1, 1.3, 1.2, 1.6] if search else [1, 1.3, 1.2])
+    wo = c[0].multiselect("Work order", sorted(u["work_order"].unique()), key=f"{key}_wo",
+                          placeholder="All")
+    ar = c[1].multiselect("Area", sorted(u["area"].unique()), key=f"{key}_ar",
+                          placeholder="All")
+    pr = c[2].multiselect("Priority", sorted(u["priority"].dropna().astype(int).unique()),
+                          key=f"{key}_pr", placeholder="All")
+    q = c[3].text_input("Search assembly / sub assembly", key=f"{key}_q",
+                        placeholder="e.g. CL1 or RFT5-2") if search else ""
+    if wo:
+        u = u[u["work_order"].isin(wo)]
+    if ar:
+        u = u[u["area"].isin(ar)]
+    if pr:
+        u = u[u["priority"].isin(pr)]
+    if q.strip():
+        ql = q.strip().lower()
+        u = u[u["assembly_mark"].str.lower().str.contains(ql, regex=False)
+              | u["unit"].str.lower().str.contains(ql, regex=False)]
+    return u
 
 
 # --------------------------------------------------------------- Overview
@@ -582,53 +635,51 @@ def page_overview() -> None:
     st.header("Project dashboard")
     if _no_data_hint():
         return
-    df = load_parts()
-    c1, c2, c3 = st.columns([1.2, 1.2, 2])
+    c1, _ = st.columns([1, 3])
     asof = c1.date_input("As of", value=_today(), max_value=_today(), format="DD/MM/YYYY",
                          help="See the project as it stood at the end of this day.")
-    wos = sorted(df["work_order"].unique())
-    pick = c2.multiselect("Work order", wos, placeholder="All work orders")
-    if pick:
-        df = df[df["work_order"].isin(pick)]
     a = asof.isoformat()
-    total = df["weight_kg"].sum()
+    uall = _filters(units_df(a), "ov", search=False)
+    u = uall[uall["in_scope"]]
+    out = uall[~uall["in_scope"]]
+    total = u["total_kg"].sum()
+    ev = events(u)
+    ev = ev[ev[UK].apply(tuple, axis=1).isin(set(u[UK].apply(tuple, axis=1)))] if len(ev) else ev
+    dated = ev[(ev["date"] != "") & (ev["date"] <= a)]
 
     with st.container(key="sg_scope"):
         k = st.columns(4)
-        k[0].metric("Total scope", t_(total), f"{len(df):,} parts", delta_color="off")
-        k[1].metric("Assemblies", f"{df['assembly_mark'].nunique():,}",
-                    f"{df.groupby(['work_order', 'unit']).ngroups:,} sub-assemblies",
+        k[0].metric("NAEC scope", t_(total), f"{u['assembly_mark'].nunique():,} assemblies",
                     delta_color="off")
-        k[2].metric("Needs painting", t_(df.loc[df['paint_req'], 'weight_kg'].sum()),
-                    f"{df['paint_req'].mean() * 100:.0f}% of parts" if len(df) else None,
+        k[1].metric("Sub assemblies", f"{len(u):,}", f"{int(u['copies'].sum()):,} pieces to make",
                     delta_color="off")
-        k[3].metric("Work orders", f"{df['work_order'].nunique():,}")
+        k[2].metric("Needs painting", t_(u.loc[u["paint_req"], "total_kg"].sum()),
+                    delta_color="off")
+        k[3].metric("Not NAEC scope", t_(out["total_kg"].sum()),
+                    f"{len(out):,} sub assemblies · not counted", delta_color="off")
 
     st.subheader("Progress by stage")
     week0 = (asof - timedelta(days=6)).isoformat()
     cols = st.columns(4)
     for col, (s, cfg) in zip(cols, STAGES.items()):
-        ap = applies(df, s)
-        scope = df.loc[ap, "weight_kg"].sum()
-        dn = df.loc[ap & done(df, s, a), "weight_kg"].sum()
-        today_kg = df.loc[ap & (df[cfg["date"]] == a), "weight_kg"].sum()
-        wk = df.loc[ap & (df[cfg["date"]] >= week0) & (df[cfg["date"]] <= a), "weight_kg"].sum()
+        ap = applies(u, s)
+        scope = u.loc[ap, "total_kg"].sum()
+        dn = (u.loc[ap, f"d_{s}"] * u.loc[ap, "copy_kg"]).sum()
+        es = dated[dated["stage"] == s]
+        today_kg = es.loc[es["date"] == a, "kg"].sum()
+        wk = es.loc[es["date"] >= week0, "kg"].sum()
         pct = dn / scope * 100 if scope else 0
         with col.container(key=f"sg_{s}"):
             st.markdown(f"<div class='st-stage'>{cfg['label']}</div>", unsafe_allow_html=True)
             st.metric(f"{pct:.1f}% complete", t_(dn), f"balance {t_(scope - dn)}",
                       delta_color="off")
             st.progress(min(pct / 100, 1.0))
-            st.caption(f"Today **{today_kg:,.0f} kg** · last 7 days **{wk / 1000:,.2f} t**")
+            st.caption(f"Today **{today_kg:,.0f} kg** · last 7 days **{wk / 1000:,.2f} t**"
+                       if scope else "No parts need this stage.")
 
     st.subheader("Assembly status")
-    # status as of the picked date: blank out dates after it
-    dfa = df.copy()
-    for cfg in STAGES.values():
-        dfa[cfg["date"]] = dfa[cfg["date"]].where(dfa[cfg["date"]] <= a, "")
-    dfa["_lv"] = part_level(dfa)
-    stat = dfa.groupby(["work_order", "assembly_mark"])["_lv"].apply(group_status)
-    w = dfa.groupby(["work_order", "assembly_mark"])["weight_kg"].sum()
+    stat = u.groupby(["work_order", "assembly_mark"])["level"].apply(group_status)
+    w = u.groupby(["work_order", "assembly_mark"])["total_kg"].sum()
     sdf = (pd.DataFrame({"status": stat, "w": w}).groupby("status")
            .agg(assemblies=("w", "size"), weight=("w", "sum"))
            .reindex(LEVELS).fillna(0).reset_index())
@@ -636,29 +687,26 @@ def page_overview() -> None:
     for col, r in zip(m, sdf.itertuples()):
         col.metric(r.status, f"{int(r.assemblies):,}", t_(r.weight), delta_color="off")
 
+    order = [c["label"] for c in STAGES.values()]
+    colors = [tok(f"st_{s}") for s in STAGES]
     st.subheader("Daily output")
     days = st.segmented_control("Window", [14, 30, 60, 90], default=30,
                                 format_func=lambda n: f"{n} days", key="ov_win") or 30
     start = (asof - timedelta(days=days - 1)).isoformat()
-    rows = []
-    for s, cfg in STAGES.items():
-        x = df[applies(df, s) & (df[cfg["date"]] >= start) & (df[cfg["date"]] <= a)]
-        g = x.groupby(cfg["date"])["weight_kg"].sum()
-        rows += [{"date": d, "stage": cfg["label"], "kg": v} for d, v in g.items()]
-    order = [c["label"] for c in STAGES.values()]
-    colors = [tok(f"st_{s}") for s in STAGES]
-    if rows:
-        cd = pd.DataFrame(rows)
+    cd = (dated[dated["date"] >= start].groupby(["date", "label"])["kg"].sum().reset_index())
+    if not cd.empty:
         cd["date"] = pd.to_datetime(cd["date"])
         ch = (alt.Chart(cd).mark_bar(cornerRadiusTopLeft=2, cornerRadiusTopRight=2)
               .encode(x=alt.X("yearmonthdate(date):T", title=None,
                               axis=alt.Axis(format="%d %b", labelAngle=0)),
-                      xOffset=alt.XOffset("stage:N", sort=order),
+                      xOffset=alt.XOffset("label:N", sort=order),
                       y=alt.Y("kg:Q", title="kg"),
-                      color=alt.Color("stage:N", sort=order, title=None,
+                      color=alt.Color("label:N", sort=order, title=None,
                                       scale=alt.Scale(domain=order, range=colors)),
-                      tooltip=[alt.Tooltip("yearmonthdate(date):T", title="Date", format="%a %d %b"),
-                               "stage:N", alt.Tooltip("kg:Q", format=",.1f")])
+                      tooltip=[alt.Tooltip("yearmonthdate(date):T", title="Date",
+                                           format="%a %d %b"),
+                               alt.Tooltip("label:N", title="Stage"),
+                               alt.Tooltip("kg:Q", format=",.1f")])
               .properties(height=300))
         st.altair_chart(dark_alt(ch), use_container_width=True)
     else:
@@ -667,13 +715,13 @@ def page_overview() -> None:
     st.subheader("Cumulative progress")
     rows = []
     for s, cfg in STAGES.items():
-        x = df[applies(df, s) & done(df, s, a)]
-        g = x.groupby(cfg["date"])["weight_kg"].sum().sort_index().cumsum()
+        base = ev.loc[(ev["stage"] == s) & (ev["date"] == ""), "kg"].sum()
+        g = dated[dated["stage"] == s].groupby("date")["kg"].sum().sort_index().cumsum() + base
         rows += [{"date": d, "stage": cfg["label"], "t": v / 1000} for d, v in g.items()]
     if rows:
         cd = pd.DataFrame(rows)
-        cd["date"] = pd.to_datetime(cd["date"], errors="coerce")
-        ch = (alt.Chart(cd.dropna()).mark_line(point=True, interpolate="step-after")
+        cd["date"] = pd.to_datetime(cd["date"])
+        ch = (alt.Chart(cd).mark_line(point=True, interpolate="step-after")
               .encode(x=alt.X("date:T", title=None, axis=alt.Axis(format="%d %b")),
                       y=alt.Y("t:Q", title="tonnes"),
                       color=alt.Color("stage:N", sort=order, title=None,
@@ -684,51 +732,27 @@ def page_overview() -> None:
         rule = alt.Chart(pd.DataFrame({"t": [total / 1000]})).mark_rule(
             strokeDash=[5, 4], color=tok("muted")).encode(y="t:Q")
         st.altair_chart(dark_alt(ch + rule), use_container_width=True)
-        st.caption(f"Dashed line = total scope {t_(total)}.")
+        st.caption(f"Dashed line = NAEC scope {t_(total)}. Bookings imported from Excel "
+                   "without a date are counted from the start.")
 
-    t1, t2 = st.tabs(["By priority", "By member type"])
+    pf = part_frame(u)
+    t1, t2, t3 = st.tabs(["By area", "By priority", "By member type"])
     with t1:
-        p = stage_pcts(dfa, ["priority"]).sort_values("priority", na_position="last")
+        show_table(stage_pcts(pf, ["work_order", "area"]).rename(
+            columns={"work_order": "WO", "area": "Area"}), "progress_by_area")
+    with t2:
+        p = stage_pcts(pf, ["priority"]).sort_values("priority", na_position="last")
         p["priority"] = p["priority"].astype("string").fillna("(none)")
         show_table(p.rename(columns={"priority": "Priority"}), "progress_by_priority")
-    with t2:
-        p = stage_pcts(dfa, ["name"]).sort_values("Weight (kg)", ascending=False)
+    with t3:
+        p = stage_pcts(pf, ["name"]).sort_values("Weight (kg)", ascending=False)
         show_table(p.rename(columns={"name": "Member type"}), "progress_by_member")
 
 
 # --------------------------------------------------------------- Update
-def _unit_table(df: pd.DataFrame, s: str) -> pd.DataFrame:
-    """One row per sub-assembly that has parts due for stage `s`."""
-    cfg = STAGES[s]
-    r = df[ready(df, s)]
-    if r.empty:
-        return pd.DataFrame()
-    prev = {"welding": "fitup_date", "paint": "welding_date"}.get(s)
-    heavy = (df.sort_values("weight_kg", ascending=False)
-             .drop_duplicates(["work_order", "assembly_mark", "unit"])
-             .set_index(["work_order", "assembly_mark", "unit"]))
-    allp = df.groupby(["work_order", "assembly_mark", "unit"]).size()
-    g = r.groupby(["work_order", "assembly_mark", "unit"]).agg(
-        priority=("priority", "min"), ready_parts=("weight_kg", "size"),
-        weight_kg=("weight_kg", "sum"),
-        prev_date=(prev, "max") if prev else ("weight_kg", "size"))
-    g["parts"] = allp.reindex(g.index).values
-    g["main member"] = (heavy.reindex(g.index)["name"] + " " +
-                        heavy.reindex(g.index)["profile"]).values
-    if s == "site":
-        g["prev_date"] = r.assign(_p=r["paint_date"].where(r["paint_req"], r["welding_date"])) \
-            .groupby(["work_order", "assembly_mark", "unit"])["_p"].max()
-    g = g.reset_index()
-    out = pd.DataFrame({
-        "✓": False,
-        "WO": g["work_order"], "Assembly": g["assembly_mark"], "Sub assembly": g["unit"],
-        "Priority": g["priority"], "Main member": g["main member"],
-        "Parts due": g["ready_parts"].astype(int), "Parts": g["parts"].astype(int),
-        "Weight (kg)": g["weight_kg"].round(2),
-    })
-    if s != "fitup":
-        out["Previous stage"] = g["prev_date"].astype(str)
-    return out.sort_values(["Priority", "Assembly", "Sub assembly"], na_position="last")
+_UNIT_SQL = "work_order = :wo AND assembly_mark = :am AND unit = :unit"
+_PARTS_UNIT_SQL = ("coalesce(work_order,'') = :wo AND assembly_mark = :am "
+                   "AND coalesce(nullif(trim(sub_assembly),''), assembly_mark) = :unit")
 
 
 def page_update() -> None:
@@ -742,152 +766,164 @@ def page_update() -> None:
     s = st.segmented_control("Stage", mine, default=mine[0], key="up_stage",
                              format_func=lambda k: STAGES[k]["label"]) or mine[0]
     cfg = STAGES[s]
-    df = load_parts()
+    u = units_df()
+    u = u[u["in_scope"]]
+    u = _filters(u, "up")
+    u = u[u[f"av_{s}"] > 0]
+    prereq = {"fitup": "", "welding": " (fit-up done)",
+              "paint": " (welded, painting required)",
+              "site": " (painted, or welded when no painting is needed)"}[s]
+    st.caption(f"Sub assemblies with copies ready for **{cfg['label'].lower()}**{prereq}: "
+               f"**{len(u):,}** · {int(u[f'av_{s}'].sum()):,} pieces · "
+               f"{(u[f'av_{s}'] * u['copy_kg']).sum():,.1f} kg")
 
-    f1, f2, f3, f4 = st.columns([1, 1.3, 1.3, 1.6])
-    wo = f1.selectbox("Work order", ["All"] + sorted(df["work_order"].unique()), key="up_wo")
-    pri = f2.multiselect("Priority", sorted(df["priority"].dropna().astype(int).unique()),
-                         key="up_pri", placeholder="All")
-    names = f3.multiselect("Member type", sorted(df["name"].unique()), key="up_name",
-                           placeholder="All")
-    q = f4.text_input("Search assembly / sub assembly", key="up_q",
-                      placeholder="e.g. R2-B1 or R2-H39")
-
-    units = _unit_table(df, s)
-    if units.empty:
-        st.success(f"Nothing is waiting for {cfg['label'].lower()} — every eligible part is booked.")
+    if u.empty:
+        st.success(f"Nothing is waiting for {cfg['label'].lower()} in this selection.")
     else:
-        if wo != "All":
-            units = units[units["WO"] == wo]
-        if pri:
-            keys = set(df[df["priority"].isin(pri)][["work_order", "unit"]]
-                       .itertuples(index=False, name=None))
-            units = units[[k in keys for k in zip(units["WO"], units["Sub assembly"])]]
-        if names:
-            keys = set(df[df["name"].isin(names)][["work_order", "unit"]]
-                       .itertuples(index=False, name=None))
-            units = units[[k in keys for k in zip(units["WO"], units["Sub assembly"])]]
-        if q.strip():
-            ql = q.strip().lower()
-            units = units[units["Assembly"].str.lower().str.contains(ql, regex=False)
-                          | units["Sub assembly"].str.lower().str.contains(ql, regex=False)]
-
-    prereq = {"fitup": "", "welding": " (fit-up done)", "paint": " (welded, painting required)",
-              "site": " (painted, or welded when no painting)"}[s]
-    st.caption(f"Sub-assemblies with parts due for **{cfg['label'].lower()}**{prereq}: "
-               f"**{len(units):,}** · {units['Weight (kg)'].sum() if len(units) else 0:,.1f} kg")
-
-    if not units.empty:
+        u = u.sort_values(["priority", "assembly_mark", "unit"], na_position="last")
         ver = st.session_state.setdefault("up_ver", 0)
-        sel_all = st.checkbox("Select all shown", key=f"up_all_{ver}")
-        units["✓"] = sel_all
+        fill = st.checkbox("Book all available", key=f"up_fill_{ver}",
+                           help="Fill every row's Book column with all copies available.")
+        tbl = pd.DataFrame({
+            "Book": (u[f"av_{s}"] if fill else u[f"av_{s}"] * 0).astype(int).values,
+            "WO": u["work_order"].values, "Area": u["area"].values,
+            "Assembly": u["assembly_mark"].values, "Sub assembly": u["unit"].values,
+            "Priority": u["priority"].values, "Main member": u["main"].values,
+            "Copies": u["copies"].values, "Done": u[f"d_{s}"].values,
+            "Available": u[f"av_{s}"].values, "kg / copy": u["copy_kg"].round(2).values,
+        })
         ed = st.data_editor(
-            units, hide_index=True, use_container_width=True, height=420,
-            disabled=[c for c in units.columns if c != "✓"],
-            column_config={"✓": st.column_config.CheckboxColumn("✓", width="small"),
-                           "Weight (kg)": st.column_config.NumberColumn(format="%.2f")},
-            key=f"up_ed_{s}_{ver}_{sel_all}_{wo}_{len(units)}")
-        picked = ed[ed["✓"]]
-        st.markdown(f"**Selected: {len(picked):,} sub-assemblies · "
-                    f"{picked['Weight (kg)'].sum():,.1f} kg**")
+            tbl, hide_index=True, use_container_width=True, height=420,
+            disabled=[c for c in tbl.columns if c != "Book"],
+            column_config={
+                "Book": st.column_config.NumberColumn(
+                    "Book", min_value=0, step=1, format="%d",
+                    help="How many copies of this sub assembly to book now"),
+                "kg / copy": st.column_config.NumberColumn(format="%.2f")},
+            key=f"up_ed_{s}_{ver}_{fill}_{len(tbl)}")
+        ed["Book"] = pd.to_numeric(ed["Book"], errors="coerce").fillna(0).astype(int)
+        over = ed[ed["Book"] > ed["Available"]]
+        picked = ed[ed["Book"] > 0]
+        kg = (picked["Book"] * picked["kg / copy"]).sum()
+        st.markdown(f"**To book: {len(picked):,} sub assemblies · {int(picked['Book'].sum()):,} "
+                    f"pieces · {kg:,.1f} kg**")
+        if not over.empty:
+            st.error("More than available on: " + ", ".join(over["Sub assembly"].head(8))
+                     + (" …" if len(over) > 8 else ""))
 
         with st.form("up_form"):
             c1, c2, c3 = st.columns(3)
             d = c1.date_input(f"{cfg['label']} date", value=_today(), max_value=_today(),
                               format="DD/MM/YYYY")
-            do_no = (c2.text_input("D.O. No.", placeholder="e.g. 012") if cfg["do"] else None)
+            do_no = (c2.text_input("D.O. No.", placeholder="e.g. NAEC-722-DHEWORKSHOP-002")
+                     if cfg["do"] else None)
             who = c3.text_input("Done by / supervisor", value=st.session_state["user"])
             go = st.form_submit_button(f"Confirm {cfg['label'].lower()}", type="primary",
                                        use_container_width=True)
         if go:
             if picked.empty:
-                st.error("Tick at least one sub-assembly.")
+                st.error("Enter how many copies to book in the Book column.")
+            elif not over.empty:
+                st.error("Fix the rows booked above what is available.")
             elif cfg["do"] and not (do_no or "").strip():
                 st.error("Enter the D.O. number.")
             else:
-                _book(s, picked, d.isoformat(), (do_no or "").strip() or None, who.strip())
+                _book(s, picked, u, d.isoformat(), (do_no or "").strip() or None, who.strip())
 
     if st.session_state.get("up_msg"):
         st.success(st.session_state.pop("up_msg"))
 
-    with st.expander(f"Undo — clear a booked {cfg['label'].lower()} date"):
-        _undo_ui(s, df)
+    with st.expander(f"Undo — remove a {cfg['label'].lower()} booking"):
+        _undo_ui(s)
 
 
-def _book(s: str, picked: pd.DataFrame, d: str, do_no: str | None, who: str) -> None:
+def _book(s: str, picked: pd.DataFrame, u: pd.DataFrame, d: str, do_no: str | None,
+          who: str) -> None:
     cfg = STAGES[s]
     ts = _now_ts()
-    sets = f"{cfg['date']} = :d, {cfg['by']} = :by, updated_at = :t"
-    if cfg["do"]:
-        sets += f", {cfg['do']} = :do"
-    rows = picked.to_dict("records")
-    steps = []
-    for r in rows:
-        p = {"wo": r["WO"], "am": r["Assembly"], "unit": r["Sub assembly"], "d": d,
-             "by": who or None, "t": ts, "do": do_no}
-        steps.append((f"UPDATE parts SET {sets} WHERE {_UNIT_SQL} "
-                      f"AND coalesce({cfg['date']},'') = '' AND {_PREV_SQL[s]}", p))
+    paint = u.set_index(["work_order", "assembly_mark", "unit"])["paint_req"]
+    steps, logs = [], []
+    for r in picked.to_dict("records"):
+        k = (r["WO"], r["Assembly"], r["Sub assembly"])
+        pv = prev_stage(s, bool(paint.get(k, False)))
+        prev_sql = (f"(SELECT coalesce(max(asm_qty),1) FROM parts WHERE {_PARTS_UNIT_SQL})"
+                    if pv is None else
+                    f"(SELECT coalesce(sum(qty),0) FROM progress WHERE {_UNIT_SQL} AND stage = :pv)")
+        p = {"wo": k[0], "am": k[1], "unit": k[2], "s": s, "pv": pv, "q": int(r["Book"]),
+             "d": d, "do": do_no, "by": who or None, "u": st.session_state["user"], "t": ts}
+        # guarded: only books what the previous stage still has available, so
+        # two people booking the same sub assembly can't overshoot
+        steps.append((f"""INSERT INTO progress (work_order, assembly_mark, unit, stage, qty,
+                                                date, do_no, done_by, username, ts)
+                          SELECT :wo, :am, :unit, :s, :q, :d, :do, :by, :u, :t
+                          WHERE {prev_sql} - (SELECT coalesce(sum(qty),0) FROM progress
+                                              WHERE {_UNIT_SQL} AND stage = :s) >= :q""", p))
+        logs.append((r, p))
     n = db.transaction(steps)
-    log = []
-    for r, k in zip(rows, n):
-        if k:
-            log.append(("""INSERT INTO progress_log (ts, username, stage, action, work_order,
-                           assembly_mark, unit, date_value, do_no, parts, weight_kg)
-                           VALUES (:t, :u, :s, 'set', :wo, :am, :unit, :d, :do, :n, :w)""",
-                        {"t": ts, "u": st.session_state["user"], "s": cfg["label"],
-                         "wo": r["WO"], "am": r["Assembly"], "unit": r["Sub assembly"],
-                         "d": d, "do": do_no, "n": k, "w": float(r["Weight (kg)"])}))
+    log = [("""INSERT INTO progress_log (ts, username, stage, action, work_order, assembly_mark,
+                                         unit, date_value, do_no, parts, weight_kg)
+               VALUES (:t, :u, :sl, 'book', :wo, :am, :unit, :d, :do, :q, :w)""",
+            {**p, "sl": cfg["label"], "w": float(r["Book"] * r["kg / copy"])})
+           for (r, p), k in zip(logs, n) if k]
     if log:
         db.transaction(log)
+    ok = [r for (r, _), k in zip(logs, n) if k]
     _refresh()
-    st.session_state["up_ver"] = st.session_state.get("up_ver", 0) + 1   # fresh ticks
+    st.session_state["up_ver"] = st.session_state.get("up_ver", 0) + 1     # fresh table
     st.session_state["up_msg"] = (
-        f"{cfg['label']} booked for {len(log)} sub-assemblies ({sum(n):,} parts, "
-        f"{picked['Weight (kg)'].sum():,.1f} kg) on {d}" + (f", D.O. {do_no}" if do_no else "")
-        + ("" if len(log) == len(picked) else
-           f". {len(picked) - len(log)} were already booked by someone else."))
+        f"{cfg['label']} booked: {len(ok)} sub assemblies, "
+        f"{sum(r['Book'] for r in ok):,} pieces, "
+        f"{sum(r['Book'] * r['kg / copy'] for r in ok):,.1f} kg on {d}"
+        + (f", D.O. {do_no}" if do_no else "")
+        + ("" if len(ok) == len(picked) else
+           f". {len(picked) - len(ok)} not booked: someone else booked them first — check again."))
     st.rerun()
 
 
-def _undo_ui(s: str, df: pd.DataFrame) -> None:
+def _undo_ui(s: str) -> None:
     cfg = STAGES[s]
-    later = {"fitup": ["welding"], "welding": ["paint", "site"], "paint": ["site"], "site": []}[s]
-    m = done(df, s)
-    for x in later:
-        m &= ~done(df, x)
-    x = df[m]
-    if x.empty:
-        st.caption("Nothing that can be cleared (a date can only be cleared while the "
-                   "next stage is still open).")
+    g = load_progress()
+    g = g[g["stage"] == s]
+    if g.empty:
+        st.caption("No bookings for this stage yet.")
         return
-    g = (x.groupby(["work_order", "assembly_mark", "unit", cfg["date"]]
-                   + ([cfg["do"]] if cfg["do"] else []))["weight_kg"]
-         .agg(["size", "sum"]).reset_index())
-    g["label"] = g.apply(lambda r: f"{r['unit']}  ·  {r[cfg['date']]}"
-                         + (f"  ·  D.O. {r[cfg['do']]}" if cfg["do"] and r[cfg["do"]] else "")
-                         + f"  ·  {r['size']} parts / {r['sum']:,.1f} kg", axis=1)
-    g = g.sort_values(cfg["date"], ascending=False)
-    pick = st.multiselect("Sub-assemblies to clear", g.index.tolist(),
-                          format_func=lambda i: g.loc[i, "label"], key=f"undo_{s}")
-    if st.button("Clear selected dates", key=f"undo_btn_{s}", disabled=not pick):
+    u = units_df().set_index(UK)
+    g = g.join(u[["paint_req"] + [f"d_{x}" for x in STAGES]], on=UK)
+    g["next"] = [next_stage(s, bool(pr)) for pr in g["paint_req"].fillna(False)]
+    g["room"] = [r[f"d_{s}"] - (r[f"d_{r['next']}"] if r["next"] else 0)
+                 for _, r in g.iterrows()]
+    g = g[g["qty"] <= g["room"]].sort_values("id", ascending=False)
+    if g.empty:
+        st.caption("Nothing can be removed: the next stage already uses these pieces. "
+                   "Remove that stage's booking first.")
+        return
+    g["label"] = g.apply(lambda r: f"{r['unit']}  ·  {r['qty']} pcs  ·  "
+                         f"{r['date'] or 'no date'}"
+                         + (f"  ·  D.O. {r['do_no']}" if r["do_no"] else "")
+                         + f"  ·  by {r['done_by'] or r['username']}", axis=1)
+    pick = st.multiselect("Bookings to remove", g["id"].tolist(),
+                          format_func=lambda i: g.set_index("id").loc[i, "label"],
+                          key=f"undo_{s}")
+    if st.button("Remove selected bookings", key=f"undo_btn_{s}", disabled=not pick):
         ts = _now_ts()
-        sets = f"{cfg['date']} = NULL, {cfg['by']} = NULL, updated_at = :t"
-        if cfg["do"]:
-            sets += f", {cfg['do']} = NULL"
         steps = []
         for i in pick:
-            r = g.loc[i]
-            p = {"wo": r["work_order"], "am": r["assembly_mark"], "unit": r["unit"], "t": ts}
-            steps.append((f"UPDATE parts SET {sets} WHERE {_UNIT_SQL} AND {_NEXT_SQL[s]}", p))
+            r = g.set_index("id").loc[i]
+            p = {"id": int(i), "wo": r["work_order"], "am": r["assembly_mark"],
+                 "unit": r["unit"], "s": s, "n": r["next"] or "-", "t": ts,
+                 "u": st.session_state["user"]}
+            steps.append((f"""DELETE FROM progress WHERE id = :id
+                AND (SELECT coalesce(sum(qty),0) FROM progress WHERE {_UNIT_SQL} AND stage = :s)
+                    - qty >= (SELECT coalesce(sum(qty),0) FROM progress
+                              WHERE {_UNIT_SQL} AND stage = :n)""", p))
             steps.append(("""INSERT INTO progress_log (ts, username, stage, action, work_order,
                              assembly_mark, unit, date_value, do_no, parts, weight_kg)
-                             VALUES (:t, :u, :s, 'clear', :wo, :am, :unit, :d, :do, :n, :w)""",
-                          {**p, "u": st.session_state["user"], "s": cfg["label"],
-                           "d": r[cfg["date"]], "do": r[cfg["do"]] if cfg["do"] else None,
-                           "n": int(r["size"]), "w": float(r["sum"])}))
+                             VALUES (:t, :u, :sl, 'remove', :wo, :am, :unit, :d, :do, :q, NULL)""",
+                          {**p, "sl": cfg["label"], "d": r["date"] or None,
+                           "do": r["do_no"] or None, "q": int(r["qty"])}))
         db.transaction(steps)
         _refresh()
-        st.session_state["up_msg"] = f"Cleared {cfg['label'].lower()} on {len(pick)} sub-assemblies."
+        st.session_state["up_msg"] = f"Removed {len(pick)} {cfg['label'].lower()} booking(s)."
         st.rerun()
 
 
@@ -896,59 +932,51 @@ def page_assemblies() -> None:
     st.header("Assemblies")
     if _no_data_hint():
         return
-    df = load_parts()
-    df = df.assign(_lv=part_level(df))
-    f1, f2, f3, f4 = st.columns([1, 1.2, 1.4, 1.6])
-    wo = f1.selectbox("Work order", ["All"] + sorted(df["work_order"].unique()), key="as_wo")
-    pri = f2.multiselect("Priority", sorted(df["priority"].dropna().astype(int).unique()),
-                         key="as_pri", placeholder="All")
-    stt = f3.multiselect("Status", LEVELS, key="as_st", placeholder="All")
-    q = f4.text_input("Search assembly mark", key="as_q")
-    if wo != "All":
-        df = df[df["work_order"] == wo]
-
-    keys = ["work_order", "assembly_mark"]
-    a = stage_pcts(df, keys)
-    a["status"] = df.groupby(keys)["_lv"].apply(group_status).values
-    a["priority"] = df.groupby(keys)["priority"].min().values
-    a["sub assemblies"] = df.groupby(keys)["unit"].nunique().values
-    last = df[[c["date"] for c in STAGES.values()]].max(axis=1)
-    a["last update"] = last.groupby([df[k] for k in keys]).max().values
-    if pri:
-        hit = set(df[df["priority"].isin(pri)]["assembly_mark"])
-        a = a[a["assembly_mark"].isin(hit)]
+    u = units_df()
+    u = _filters(u, "as")
+    c1, c2 = st.columns([2, 1])
+    stt = c1.multiselect("Status", LEVELS + ["Not NAEC scope"], key="as_st", placeholder="All")
+    keys = ["work_order", "area", "assembly_mark"]
+    pf = part_frame(u)
+    a = stage_pcts(pf, keys)
+    grp = u.groupby(keys)
+    a["Status"] = grp["level"].apply(group_status).values
+    a.loc[~grp["in_scope"].all().values, "Status"] = "Not NAEC scope"
+    a["Priority"] = grp["priority"].min().values
+    a["Sub assemblies"] = grp["unit"].size().values
+    a["Pieces"] = grp["copies"].sum().values
+    last = u[[f"last_{s}" for s in STAGES]].max(axis=1)
+    a["Last update"] = last.groupby([u[k] for k in keys]).max().values
     if stt:
-        a = a[a["status"].isin(stt)]
-    if q.strip():
-        a = a[a["assembly_mark"].str.lower().str.contains(q.strip().lower(), regex=False)]
-    a = a[["work_order", "assembly_mark", "priority", "status", "sub assemblies", "Parts",
-           "Weight (kg)"] + PCT_COLS + ["last update"]]
-    a = a.sort_values(["priority", "assembly_mark"], na_position="last")
+        a = a[a["Status"].isin(stt)]
+    a = a[keys + ["Priority", "Status", "Sub assemblies", "Pieces", "Weight (kg)"] + PCT_COLS
+          + ["Last update"]].sort_values(["Priority", "assembly_mark"], na_position="last")
     st.caption(f"{len(a):,} assemblies · {a['Weight (kg)'].sum() / 1000:,.2f} t")
-    show_table(a.rename(columns={"work_order": "WO", "assembly_mark": "Assembly",
-                                 "priority": "Priority", "status": "Status",
-                                 "sub assemblies": "Sub assemblies",
-                                 "last update": "Last update"}), "assemblies", height=420)
+    show_table(a.rename(columns={"work_order": "WO", "area": "Area",
+                                 "assembly_mark": "Assembly"}), "assemblies", height=420)
 
     st.subheader("Assembly detail")
     if a.empty:
         return
     pick = st.selectbox("Assembly", a["assembly_mark"].tolist(), key="as_pick")
-    x = df[df["assembly_mark"] == pick]
-    u = stage_pcts(x, ["unit"])
-    u["status"] = x.groupby("unit")["_lv"].apply(group_status).values
-    st.markdown("**Sub-assemblies**")
-    show_table(u.rename(columns={"unit": "Sub assembly", "status": "Status"}),
-               f"subassemblies_{pick}")
-    st.markdown("**Parts**")
-    cols = ["unit", "part_mark", "qty", "name", "profile", "length_mm", "weight_kg", "grade",
-            "painting_req", "fitup_date", "welding_date", "paint_date", "paint_do",
-            "site_date", "site_do"]
-    show_table(x[cols].rename(columns={
-        "unit": "Sub assembly", "part_mark": "Part", "qty": "No.", "length_mm": "Length (mm)",
-        "weight_kg": "Weight (kg)", "painting_req": "Paint", "fitup_date": "Fit-up",
-        "welding_date": "Welding", "paint_date": "Painting", "paint_do": "Paint D.O.",
-        "site_date": "To site", "site_do": "Site D.O."}), f"parts_{pick}")
+    x = u[u["assembly_mark"] == pick]
+    det = pd.DataFrame({"Sub assembly": x["unit"], "Main member": x["main"],
+                        "Copies": x["copies"], "kg / copy": x["copy_kg"].round(2),
+                        "Total (kg)": x["total_kg"].round(2), "Status": x["status"]})
+    for s, cfg in STAGES.items():
+        det[cfg["label"]] = [f"{d}/{c}" if (s != "paint" or pr) else "—"
+                             for d, c, pr in zip(x[f"d_{s}"], x["copies"], x["paint_req"])]
+    st.markdown("**Sub assemblies** (pieces done / pieces to make)")
+    show_table(det, f"subassemblies_{pick}")
+    st.markdown("**Parts (one copy)**")
+    p = load_parts()
+    p = p[p["assembly_mark"] == pick]
+    show_table(p[["unit", "part_mark", "qty", "name", "profile", "grade", "length_mm",
+                  "unit_weight", "weight_kg", "asm_qty", "painting_req", "scope"]].rename(
+        columns={"unit": "Sub assembly", "part_mark": "Part", "qty": "No.", "name": "Name",
+                 "profile": "Profile", "grade": "Material", "length_mm": "Length (mm)",
+                 "unit_weight": "kg / pc", "weight_kg": "kg / copy", "asm_qty": "Copies",
+                 "painting_req": "Painting", "scope": "NAEC scope"}), f"parts_{pick}")
 
 
 # --------------------------------------------------------------- Reports
@@ -956,7 +984,7 @@ def page_reports() -> None:
     st.header("Reports")
     if _no_data_hint():
         return
-    df = load_parts()
+    u = units_df()
     t1, t2, t3 = st.tabs(["Daily / period report", "D.O. register", "Export master database"])
 
     with t1:
@@ -977,38 +1005,31 @@ def page_reports() -> None:
             end = c3.date_input("To", value=end, format="DD/MM/YYYY", key="rp_to")
         s_, e_ = start.isoformat(), end.isoformat()
         st.caption(f"{start:%a %d %b %Y} → {end:%a %d %b %Y}")
-
+        ev = events(u)
+        ev = ev[(ev["date"] >= s_) & (ev["date"] <= e_)]
         k = st.columns(4)
-        daily = {}
-        detail = []
         for col, (s, cfg) in zip(k, STAGES.items()):
-            x = df[applies(df, s) & (df[cfg["date"]] >= s_) & (df[cfg["date"]] <= e_)]
+            x = ev[ev["stage"] == s]
             with col.container(key=f"sg_{s}"):
-                st.metric(cfg["label"], f"{x['weight_kg'].sum():,.1f} kg",
-                           f"{x.groupby(['work_order', 'unit']).ngroups:,} sub-assemblies",
-                           delta_color="off")
-            daily[cfg["label"] + " (kg)"] = x.groupby(cfg["date"])["weight_kg"].sum()
-            if not x.empty:
-                g = x.groupby(["work_order", "assembly_mark", "unit", cfg["date"]]
-                              + ([cfg["do"]] if cfg["do"] else [])).agg(
-                    parts=("weight_kg", "size"), kg=("weight_kg", "sum")).reset_index()
-                g = g.rename(columns={cfg["date"]: "Date", "work_order": "WO",
-                                      "assembly_mark": "Assembly", "unit": "Sub assembly",
-                                      (cfg["do"] or "_"): "D.O. No.", "parts": "Parts",
-                                      "kg": "Weight (kg)"})
-                g.insert(0, "Stage", cfg["label"])
-                detail.append(g)
-        dd = pd.DataFrame(daily).fillna(0.0)
-        dd.index.name = "Date"
-        dd = dd.reindex(sorted(dd.index)).reset_index()
+                st.metric(cfg["label"], f"{x['kg'].sum():,.1f} kg",
+                          f"{int(x['qty'].sum()):,} pieces", delta_color="off")
+        dd = (ev.pivot_table(index="date", columns="label", values="kg", aggfunc="sum")
+              .reindex(columns=[c["label"] for c in STAGES.values()]).fillna(0.0))
+        dd.columns = [f"{c} (kg)" for c in dd.columns]
+        dd = dd.reset_index().rename(columns={"date": "Date"})
         if not dd.empty:
             tot = {"Date": "TOTAL", **{c: dd[c].sum() for c in dd.columns if c != "Date"}}
             dd = pd.concat([dd, pd.DataFrame([tot])], ignore_index=True)
         st.markdown("**Daily output (kg)**")
         show_table(dd, f"daily_{s_}_{e_}", download=False)
-        det = (pd.concat(detail, ignore_index=True) if detail else pd.DataFrame())
+        det = (ev.sort_values(["date", "stage", "assembly_mark", "unit"])
+               [["label", "date", "work_order", "area", "assembly_mark", "unit", "qty", "kg",
+                 "do_no", "done_by"]]
+               .rename(columns={"label": "Stage", "date": "Date", "work_order": "WO",
+                                "area": "Area", "assembly_mark": "Assembly",
+                                "unit": "Sub assembly", "qty": "Pieces", "kg": "Weight (kg)",
+                                "do_no": "D.O. No.", "done_by": "Done by"}))
         if not det.empty:
-            det = det.sort_values(["Date", "Stage", "Assembly", "Sub assembly"])
             st.markdown("**What was done**")
             show_table(det, f"detail_{s_}_{e_}", download=False, height=360)
         heads = [f"SteelTrack — progress report{(' — ' + PROJECT) if PROJECT else ''}",
@@ -1022,47 +1043,55 @@ def page_reports() -> None:
             file_name=f"SteelTrack_report_{s_}_{e_}.xlsx", key="rp_xlsx")
 
     with t2:
-        kind = st.segmented_control("Delivery", ["paint", "site"], default="paint", key="do_kind",
-                                    format_func=lambda k: STAGES[k]["label"]) or "paint"
-        cfg = STAGES[kind]
-        x = df[df[cfg["do"]] != ""]
+        ev = events(u)
+        x = ev[(ev["stage"] == "site") & (ev["do_no"] != "")]
         if x.empty:
-            st.caption("No D.O. recorded yet.")
+            st.caption("No delivery order recorded yet.")
         else:
-            reg = (x.groupby(cfg["do"]).agg(
-                date=(cfg["date"], "max"), assemblies=("assembly_mark", "nunique"),
-                sub_assemblies=("unit", "nunique"), parts=("weight_kg", "size"),
-                weight_kg=("weight_kg", "sum")).reset_index()
-                .rename(columns={cfg["do"]: "D.O. No.", "date": "Date",
-                                 "sub_assemblies": "Sub assemblies", "assemblies": "Assemblies",
-                                 "parts": "Parts", "weight_kg": "Weight (kg)"})
+            reg = (x.groupby("do_no").agg(
+                date=("date", "max"), assemblies=("assembly_mark", "nunique"),
+                subs=("unit", "nunique"), pcs=("qty", "sum"), kg=("kg", "sum")).reset_index()
+                .rename(columns={"do_no": "D.O. No.", "date": "Date", "assemblies": "Assemblies",
+                                 "subs": "Sub assemblies", "pcs": "Pieces", "kg": "Weight (kg)"})
                 .sort_values(["Date", "D.O. No."], ascending=False))
-            show_table(reg, f"do_register_{kind}")
+            show_table(reg, "do_register")
             pick = st.selectbox("D.O. contents", reg["D.O. No."].tolist(), key="do_pick")
-            y = x[x[cfg["do"]] == pick]
-            lst = (y.groupby(["work_order", "assembly_mark", "unit"]).agg(
-                parts=("weight_kg", "size"), pcs=("qty", "sum"), kg=("weight_kg", "sum"))
-                .reset_index().rename(columns={"work_order": "WO", "assembly_mark": "Assembly",
-                                               "unit": "Sub assembly", "parts": "Parts",
-                                               "pcs": "Pcs", "kg": "Weight (kg)"}))
-            show_table(lst, f"do_{kind}_{pick}", download=False)
-            heads = [f"Delivery list — {cfg['label']} — D.O. {pick}",
-                     f"Date: {y[cfg['date']].max()}   ·   {len(lst)} sub-assemblies   ·   "
-                     f"{y['weight_kg'].sum():,.2f} kg" + (f"   ·   {PROJECT}" if PROJECT else "")]
+            y = x[x["do_no"] == pick]
+            lst = (y.groupby(["work_order", "area", "assembly_mark", "unit"])
+                   .agg(pcs=("qty", "sum"), kg=("kg", "sum")).reset_index()
+                   .rename(columns={"work_order": "WO", "area": "Area", "assembly_mark": "Assembly",
+                                    "unit": "Sub assembly", "pcs": "Pieces",
+                                    "kg": "Weight (kg)"}))
+            show_table(lst, f"do_{pick}", download=False)
+            heads = [f"Delivery list — D.O. {pick}",
+                     f"Date: {y['date'].max()}   ·   {int(lst['Pieces'].sum())} pieces   ·   "
+                     f"{y['kg'].sum():,.2f} kg" + (f"   ·   {PROJECT}" if PROJECT else "")]
             st.download_button("⬇ Delivery list (.xlsx)",
                                reports.workbook({"Delivery list": lst}, {"Weight (kg)": "#,##0.00"},
                                                 {"Delivery list": heads}),
-                               file_name=f"DO_{kind}_{pick}.xlsx", key="do_xlsx")
+                               file_name=f"DO_{pick}.xlsx", key="do_xlsx")
 
     with t3:
-        st.write("Download the whole database in the same 25-column layout as "
-                 "`master_database_final.xlsx` (stage kg = part weight once a date is booked).")
+        st.write("Download the whole database in the same layout as "
+                 "`MASTER DATABASE 722-1.xlsx` (sheet *Progress*). Stage kg = row weight × "
+                 "pieces done; date = last booking.")
         if st.button("Prepare Excel file", key="mx_prep"):
-            st.session_state["mx_bytes"] = reports.master_xlsx(load_parts())
+            st.session_state["mx_bytes"] = reports.master_xlsx(_export_frame(u))
         if st.session_state.get("mx_bytes"):
-            st.download_button("⬇ master_database.xlsx", st.session_state["mx_bytes"],
+            st.download_button("⬇ MASTER DATABASE.xlsx", st.session_state["mx_bytes"],
                                type="primary",
-                               file_name=f"master_database_{_today():%Y%m%d}.xlsx", key="mx_dl")
+                               file_name=f"MASTER DATABASE {_today():%Y%m%d}.xlsx", key="mx_dl")
+
+
+def _export_frame(u: pd.DataFrame) -> pd.DataFrame:
+    g = load_progress()
+    dos = (g[(g["stage"] == "site") & (g["do_no"] != "")].groupby(UK)["do_no"]
+           .agg(lambda s: ", ".join(dict.fromkeys(s))).rename("site_dos"))
+    cols = UK + [f"d_{s}" for s in STAGES] + [f"last_{s}" for s in STAGES]
+    p = load_parts().merge(u[cols], on=UK, how="left").merge(
+        dos.reset_index(), on=UK, how="left")
+    p["site_dos"] = p["site_dos"].fillna("")
+    return p
 
 
 # --------------------------------------------------------------- Activity
@@ -1073,12 +1102,12 @@ def page_activity() -> None:
         lg = db.query("""SELECT ts AS "Time", username AS "User", stage AS "Stage",
                                 action AS "Action", work_order AS "WO",
                                 assembly_mark AS "Assembly", unit AS "Sub assembly",
-                                date_value AS "Date", do_no AS "D.O.", parts AS "Parts",
+                                date_value AS "Date", do_no AS "D.O.", parts AS "Pieces",
                                 weight_kg AS "Weight (kg)"
                          FROM progress_log ORDER BY id DESC LIMIT 2000""", ttl=0)
-        u = st.multiselect("User", sorted(lg["User"].dropna().unique()), key="ac_u")
-        if u:
-            lg = lg[lg["User"].isin(u)]
+        who = st.multiselect("User", sorted(lg["User"].dropna().unique()), key="ac_u")
+        if who:
+            lg = lg[lg["User"].isin(who)]
         show_table(lg, "progress_log", height=480)
     with t2:
         show_table(db.query("""SELECT ts AS "Time", username AS "User" FROM user_log
@@ -1091,42 +1120,58 @@ def page_admin() -> None:
     t1, t2, t3 = st.tabs(["Import master database", "Backups", "Project settings"])
     with t1:
         st.write("Upload the master database Excel (same layout as "
-                 "`master_database_final.xlsx`, sheet **Master Database**).")
+                 "`MASTER DATABASE 722-1.xlsx`, sheet **Progress**).")
         up = st.file_uploader("Excel file", type=["xlsx", "xlsm"], key="imp_file")
         if up is not None:
             try:
-                new = reports.parse_master(up)
+                parts, prog, warn = reports.parse_master(up)
             except Exception as e:
                 st.error(f"Can't read that file: {e}")
                 return
+            pu = parts.assign(unit=parts["sub_assembly"].fillna(parts["assembly_mark"]))
+            un = pu.groupby(["work_order", "assembly_mark", "unit"]).agg(
+                kg=("weight_kg", "sum"), q=("asm_qty", "first"), sc=("scope", "first"))
+            un["t"] = un["kg"] * un["q"]
             k = st.columns(4)
-            k[0].metric("Rows", f"{len(new):,}")
-            k[1].metric("Assemblies", f"{new['assembly_mark'].nunique():,}")
-            k[2].metric("Total weight", t_(new["weight_kg"].sum()))
-            k[3].metric("Rows with fit-up date", f"{new['fitup_date'].notna().sum():,}")
-            with st.expander("Preview (first 50 rows)"):
-                st.dataframe(new.head(50), use_container_width=True, hide_index=True)
+            k[0].metric("Rows", f"{len(parts):,}",
+                        f"{parts['assembly_mark'].nunique():,} assemblies", delta_color="off")
+            k[1].metric("Sub assemblies", f"{len(un):,}", f"{int(un['q'].sum()):,} pieces",
+                        delta_color="off")
+            k[2].metric("NAEC scope", t_(un.loc[un["sc"] != "NO", "t"].sum()),
+                        f"not NAEC: {t_(un.loc[un['sc'] == 'NO', 't'].sum())}",
+                        delta_color="off")
+            k[3].metric("Progress in the file", f"{len(prog):,} records",
+                        f"{int((prog['date'].isna()).sum()) if len(prog) else 0} without date",
+                        delta_color="off")
+            if warn:
+                with st.expander(f"⚠ {len(warn)} thing(s) to check in the file", expanded=True):
+                    for w_ in warn:
+                        st.write("• " + w_)
+            with st.expander("Preview"):
+                st.dataframe(parts.head(100), use_container_width=True, hide_index=True)
+                if len(prog):
+                    st.dataframe(prog, use_container_width=True, hide_index=True)
             existing = len(load_parts())
             mode = st.radio(
-                "Import mode",
-                ["merge", "replace"],
+                "Import mode", ["merge", "replace"],
                 format_func=lambda m: {
                     "merge": "Add new parts & update details (keeps progress booked in the app)",
                     "replace": "Replace everything with this file (progress comes from the file)",
                 }[m], key="imp_mode", index=0 if existing else 1)
             ok = True
             if mode == "replace" and existing:
-                st.warning(f"This deletes all {existing:,} parts now in the database "
-                           "(a backup copy is made first).")
+                st.warning(f"This deletes all {existing:,} parts and all progress bookings now "
+                           "in the database (a backup copy is made first).")
                 ok = st.text_input("Type REPLACE to confirm", key="imp_conf") == "REPLACE"
             if st.button("Import", type="primary", disabled=not ok, key="imp_go"):
                 with st.spinner("Importing…"):
-                    msg = db.import_parts(db.engine(), new, mode, _now_ts(), _stamp())
+                    msg = db.import_parts(db.engine(), parts, prog, mode, _now_ts(), _stamp())
                 _refresh()
                 st.success(msg)
 
     with t2:
-        st.caption("A backup copy of the parts table is taken automatically before every import.")
+        st.caption("A backup copy of parts + progress is taken automatically before every "
+                   "import and restore.")
         if st.button("Take a backup now", key="bk_now"):
             with db.engine().begin() as cx:
                 name = db.snapshot(cx, _stamp())
@@ -1140,10 +1185,10 @@ def page_admin() -> None:
             if c1.button("Restore this backup", key="bk_restore"):
                 st.session_state["bk_confirm"] = b
             if c2.button("Delete this backup", key="bk_drop"):
-                db.execute(f"DROP TABLE {b}")
+                db.drop_backup(b)
                 st.rerun()
             if st.session_state.get("bk_confirm") == b:
-                st.warning(f"Restore `{b}`? Current parts are backed up first, then replaced.")
+                st.warning(f"Restore `{b}`? Current data is backed up first, then replaced.")
                 if st.button("Yes, restore", type="primary", key="bk_yes"):
                     cur = db.restore(db.engine(), b, _stamp())
                     st.session_state.pop("bk_confirm", None)
