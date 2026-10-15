@@ -297,7 +297,7 @@ inject_css()
 logout_splash()
 
 try:
-    _seeded = db.ensure_schema()
+    _seeded = db.ensure_schema(db.schema_version())
 except Exception as e:                       # no / wrong secrets, DB down
     st.error("Cannot reach the database. Check `[connections.steel]` in "
              "`.streamlit/secrets.toml` (or the app's Secrets on Streamlit Cloud).")
@@ -447,6 +447,9 @@ LEVELS = ["Not started", "In progress", "Fit-up done", "Welded", "Ready for site
 @st.cache_data(ttl=30, show_spinner=False)
 def load_parts() -> pd.DataFrame:
     df = db.query("SELECT * FROM parts ORDER BY id", ttl=0)
+    for c in db.PART_COLS:                  # tolerate a table not migrated yet
+        if c not in df.columns:
+            df[c] = None
     for c in ("work_order", "scope", "area", "assembly_mark", "sub_assembly", "part_mark",
               "name", "profile", "grade", "painting_req", "remark"):
         df[c] = df[c].fillna("").astype(str).str.strip()

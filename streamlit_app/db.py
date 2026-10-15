@@ -123,8 +123,17 @@ _TABLES = ["parts", "progress", "progress_log", "user_credentials", "user_log",
            "project_settings"]
 
 
+def schema_version() -> str:
+    """Changes whenever the table layout in this file changes. ensure_schema
+    is cached per version: Streamlit Cloud can swap in new code without
+    restarting the process, and a cache keyed only on the function would
+    skip the migration and leave new columns (e.g. 'welded') missing."""
+    return hashlib.sha1("|".join(_ddl("postgresql") + list(_part_coldefs("x")))
+                        .encode()).hexdigest()[:12]
+
+
 @st.cache_resource
-def ensure_schema() -> bool:
+def ensure_schema(version: str = "") -> bool:
     """Create missing tables/columns; seed a first admin when there are no
     users. Returns True when the default admin was just created."""
     d = dialect()
