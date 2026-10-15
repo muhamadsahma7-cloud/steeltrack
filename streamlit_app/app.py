@@ -838,12 +838,13 @@ def _overview_work_orders(u: pd.DataFrame) -> None:
     iss["backlog"] = (iss["d_fitup"] - iss["d_welding"]).clip(lower=0).where(iss["weld_req"], 0)
     for c in ("fit_bal", "weld_bal", "backlog", "d_fitup", "d_welding", "d_site"):
         iss[f"{c}_kg"] = iss[c] * iss["copy_kg"]
-    sub = f"{t_(iss['total_kg'].sum())} · {int(iss['copies'].sum()):,} pcs"
+    n_wo = iss["work_order"].nunique()
+    sub = f"{n_wo:,} WO{'s' if n_wo != 1 else ''} · {int(iss['copies'].sum()):,} pcs"
     if not nis.empty:
         sub += f" · not issued {t_(nis['total_kg'].sum())}"
     k = st.columns(4)
     for col, key, label, val, d in (
-        (k[0], "wo_scope", "Work orders issued", f"{iss['work_order'].nunique():,}", sub),
+        (k[0], "wo_scope", "Work orders issued", t_(iss["total_kg"].sum()), sub),
         (k[1], "wo_fitup", "Balance to fit-up", t_(iss["fit_bal_kg"].sum()),
          f"{int(iss['fit_bal'].sum()):,} pcs"),
         (k[2], "wo_welding", "Balance to welding", t_(iss["weld_bal_kg"].sum()),
