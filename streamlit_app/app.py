@@ -236,6 +236,28 @@ def dark_alt(chart):
             .configure_legend(labelColor=axis, titleColor=axis, orient="top"))
 
 
+def donut(done: float, total: float, color: str):
+    """Done-vs-balance ring with the % in the middle (as in Team Piping)."""
+    d = is_dark()
+    pct = done / total * 100 if total else 0
+    src = pd.DataFrame({"part": ["Done", "Balance"],
+                        "t": [done / 1000, max(total - done, 0.0) / 1000]})
+    if not total:                                   # stage not needed: grey ring
+        src = pd.DataFrame({"part": ["Balance"], "t": [1.0]})
+    arc = (alt.Chart(src).mark_arc(innerRadius=52, outerRadius=76, cornerRadius=3)
+           .encode(theta=alt.Theta("t:Q", stack=True),
+                   color=alt.Color("part:N", legend=None,
+                                   scale=alt.Scale(domain=["Done", "Balance"],
+                                                   range=[color, "#2b3a52" if d else "#e5e9f0"])),
+                   order=alt.Order("part:N", sort="descending"),
+                   tooltip=[alt.Tooltip("part:N", title=""),
+                            alt.Tooltip("t:Q", title="tonnes", format=",.2f")]))
+    txt = (alt.Chart(pd.DataFrame({"t": [f"{pct:.1f}%" if total else "N/A"]}))
+           .mark_text(size=21, fontWeight="bold", color="#e2e8f0" if d else "#1f2933")
+           .encode(text="t:N"))
+    return (arc + txt).properties(height=175)
+
+
 # --------------------------------------------------------------- splashes
 def welcome_splash() -> None:
     """One-shot weld-bead flourish right after sign-in (CSS/SVG only)."""
@@ -723,12 +745,11 @@ def page_overview() -> None:
         dn = (u.loc[ap, f"d_{s}"] * u.loc[ap, "copy_kg"]).sum()
         es = dated[dated["stage"] == s]
         wk = es.loc[es["date"] >= week0, "kg"].sum()
-        pct = dn / scope * 100 if scope else 0
         with col.container(key=f"sg_{s}"):
             st.markdown(f"<div class='st-stage'>{cfg['label']}</div>", unsafe_allow_html=True)
-            st.metric(f"{pct:.1f}% complete", t_(dn), f"balance {t_(scope - dn)}",
-                      delta_color="off")
-            st.progress(min(pct / 100, 1.0))
+            st.altair_chart(dark_alt(donut(dn, scope, tok(f"st_{s}"))),
+                            use_container_width=True)
+            st.metric("Done", t_(dn), f"balance {t_(scope - dn)}", delta_color="off")
             st.caption(f"Last 7 days **{wk / 1000:,.2f} t**" if scope
                        else "No parts need this stage.")
 
