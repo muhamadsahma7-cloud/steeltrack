@@ -69,7 +69,7 @@ def transaction(steps: list[tuple[str, dict]]) -> list[int]:
 # The app creates its own tables on first start, so a brand-new (empty)
 # Supabase project only needs its connection string in secrets.
 PART_COLS = [
-    "work_order", "priority", "scope", "area", "assembly_mark", "sub_assembly",
+    "work_order", "priority", "scope", "welded", "area", "assembly_mark", "sub_assembly",
     "part_mark", "qty", "name", "profile", "grade", "length_mm", "surface_area",
     "unit_weight", "weight_kg", "total_weight", "asm_qty", "painting_req", "remark",
     "updated_at",
@@ -86,7 +86,8 @@ def _types(d: str) -> tuple[str, str]:
 
 def _part_coldefs(fl: str) -> dict[str, str]:
     return {
-        "work_order": "TEXT", "priority": "INTEGER", "scope": "TEXT", "area": "TEXT",
+        "work_order": "TEXT", "priority": "INTEGER", "scope": "TEXT", "welded": "TEXT",
+        "area": "TEXT",
         "assembly_mark": "TEXT", "sub_assembly": "TEXT", "part_mark": "TEXT",
         "qty": "INTEGER", "name": "TEXT", "profile": "TEXT", "grade": "TEXT",
         "length_mm": fl, "surface_area": fl, "unit_weight": fl, "weight_kg": fl,
@@ -205,7 +206,7 @@ def set_settings(values: dict, ts: str) -> None:
 # ------------------------------------------------------- import & backups
 # These take the SQLAlchemy engine/connection explicitly so they can be
 # exercised outside a Streamlit run.
-_DETAIL = ["priority", "scope", "area", "qty", "name", "profile", "grade", "length_mm",
+_DETAIL = ["priority", "scope", "welded", "area", "qty", "name", "profile", "grade", "length_mm",
            "surface_area", "unit_weight", "weight_kg", "total_weight", "asm_qty",
            "painting_req", "remark"]
 _KEY = ["work_order", "assembly_mark", "sub_assembly", "part_mark"]

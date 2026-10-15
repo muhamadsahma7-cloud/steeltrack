@@ -10,6 +10,7 @@ Master database layout = the 'Progress' sheet of MASTER DATABASE 722-1.xlsx
                   (B132-1..10)        -> asm_qty = TOTAL / block weight, stored
                   on every part row = copies of that row's sub assembly
     NAEC Scope    NO = not fabricated by NAEC (kept, left out of progress)
+    Welded?       NO = a single piece (purlin, plain beam): no fit-up / welding
     Painting status  Yes = must be blasted & painted before site
 """
 
@@ -26,7 +27,7 @@ from openpyxl.utils import get_column_letter
 # (header, parts column). Progress columns are filled from the progress table.
 HEADERS = [
     ("Work order no", "work_order"), ("Priority no", "priority"), ("NAEC Scope", "scope"),
-    ("Area", "area"), ("Assembly Mark", "assembly_mark"), ("Sub Assembly", "sub_assembly"),
+    ("Welded?", "welded"), ("Area", "area"), ("Assembly Mark", "assembly_mark"), ("Sub Assembly", "sub_assembly"),
     ("Part Mark", "part_mark"), ("No.", "qty"), ("Name", "name"), ("Profile", "profile"),
     ("MATERIAL", "grade"), ("Length (Mm)", "length_mm"), ("AREA", "surface_area"),
     ("WEIGHT", "unit_weight"), ("TOTAL WEIGHT", "total_weight"),
@@ -44,7 +45,7 @@ ALL_HEADERS = ([h for h, _ in HEADERS] + [h for p in STAGE_HEADS.values() for h 
                + [DO_HEAD])
 
 REQUIRED = ["Work order no", "Assembly Mark", "Part Mark", "No.", "WEIGHT"]
-_TEXT = ["work_order", "scope", "area", "assembly_mark", "sub_assembly", "part_mark", "name",
+_TEXT = ["work_order", "scope", "welded", "area", "assembly_mark", "sub_assembly", "part_mark", "name",
          "profile", "grade", "painting_req", "remark"]
 
 
@@ -116,6 +117,7 @@ def parse_master(file) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
     p["unit_weight"] = p["unit_weight"].fillna(0.0)
     p["weight_kg"] = p["qty"].astype(float) * p["unit_weight"]
     p["scope"] = p["scope"].fillna("YES").str.upper()
+    p["welded"] = p["welded"].fillna("YES").str.upper()      # older sheets have no Welded?
     p["unit"] = p["sub_assembly"].fillna(p["assembly_mark"])
 
     # copies = TOTAL WEIGHT / weight of the block of rows it heads
@@ -145,6 +147,7 @@ def parse_master(file) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
 
     # progress already recorded in the sheet -> one booking per unit + stage
     paint = p["painting_req"].fillna("").str.upper().isin(["YES", "Y"])
+    weld = p["welded"] != "NO"
     rows = []
     for s, (kh, dh) in STAGE_HEADS.items():
         d = raw[dh].map(_clean_date)
@@ -159,7 +162,7 @@ def parse_master(file) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
         t = p[["work_order", "assembly_mark", "unit"]].assign(
             done=per.where(has, 0), date=d,
             do_no=raw[DO_HEAD].map(_clean_text) if s == "site" else None,
-            applies=paint if s == "paint" else True)
+            applies=paint if s == "paint" else weld if s in ("fitup", "welding") else True)
         t = t[t["applies"]]
         for k, gg in t.groupby(["work_order", "assembly_mark", "unit"], dropna=False):
             n = int(gg["done"].min())             # every part of the unit must be there
@@ -172,25 +175,27 @@ def parse_master(file) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
                          "done_by": "from Excel"})
     prog = pd.DataFrame(rows, columns=["work_order", "assembly_mark", "unit", "stage", "qty",
                                        "date", "do_no", "done_by"])
-    prog = _backfill(prog, p, paint)
+    prog = _backfill(prog, p, paint, weld)
     p = p.drop(columns=["unit"])
     return p, prog, warn
 
 
-def _backfill(prog: pd.DataFrame, p: pd.DataFrame, paint: pd.Series) -> pd.DataFrame:
+def _backfill(prog: pd.DataFrame, p: pd.DataFrame, paint: pd.Series,
+              weld: pd.Series) -> pd.DataFrame:
     """A unit recorded at a later stage (e.g. sent to site) went through the
     earlier ones too, even if the sheet has no date for them. Add those
     earlier stages with NO date: they count in the totals but not in any
     day's output."""
     if prog.empty:
         return prog
-    unit_paint = (p.assign(_p=paint).groupby(["work_order", "assembly_mark", "unit"],
-                                             dropna=False)["_p"].any())
+    unit_req = (p.assign(_p=paint, _w=weld)
+                .groupby(["work_order", "assembly_mark", "unit"], dropna=False)[["_p", "_w"]]
+                .any())
     have = {(r.work_order, r.assembly_mark, r.unit, r.stage): r.qty
             for r in prog.itertuples()}
     extra = []
-    for (wo, am, un), needs_paint in unit_paint.items():
-        chain = ["fitup", "welding"] + (["paint"] if needs_paint else []) + ["site"]
+    for (wo, am, un), r in unit_req.iterrows():
+        chain = (["fitup", "welding"] if r["_w"] else []) + (["paint"] if r["_p"] else []) + ["site"]
         top = 0
         for s in reversed(chain):
             top = max(top, have.get((wo, am, un, s), 0))

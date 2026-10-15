@@ -458,6 +458,8 @@ def load_parts() -> pd.DataFrame:
     df["asm_qty"] = pd.to_numeric(df["asm_qty"], errors="coerce").fillna(1).astype(int)
     df["unit"] = df["sub_assembly"].where(df["sub_assembly"] != "", df["assembly_mark"])
     df["paint_req"] = df["painting_req"].str.upper().isin(["YES", "Y"])
+    # Welded? = NO: a single piece (purlin, plain beam, angle) - no fit-up/welding
+    df["weld_req"] = df["welded"].fillna("").astype(str).str.strip().str.upper() != "NO"
     df["in_scope"] = df["scope"].str.upper() != "NO"
     return df
 
@@ -474,14 +476,20 @@ def load_progress() -> pd.DataFrame:
     return df
 
 
-def prev_stage(s: str, paint_req: bool) -> str | None:
-    return {"fitup": None, "welding": "fitup", "paint": "welding",
-            "site": "paint" if paint_req else "welding"}[s]
+def route(paint_req: bool, weld_req: bool) -> list[str]:
+    """The stages a sub assembly goes through, in order."""
+    return ((["fitup", "welding"] if weld_req else []) + (["paint"] if paint_req else [])
+            + ["site"])
 
 
-def next_stage(s: str, paint_req: bool) -> str | None:
-    return {"fitup": "welding", "welding": "paint" if paint_req else "site",
-            "paint": "site", "site": None}[s]
+def prev_stage(s: str, paint_req: bool, weld_req: bool) -> str | None:
+    r = route(paint_req, weld_req)
+    return r[r.index(s) - 1] if s in r and r.index(s) > 0 else None
+
+
+def next_stage(s: str, paint_req: bool, weld_req: bool) -> str | None:
+    r = route(paint_req, weld_req)
+    return r[r.index(s) + 1] if s in r and r.index(s) + 1 < len(r) else None
 
 
 def units_df(asof: str | None = None) -> pd.DataFrame:
@@ -493,7 +501,8 @@ def units_df(asof: str | None = None) -> pd.DataFrame:
     heavy = p.sort_values("weight_kg", ascending=False).drop_duplicates(UK).set_index(UK)
     u = p.groupby(UK, sort=False).agg(
         priority=("priority", "min"), area=("area", "first"), in_scope=("in_scope", "all"),
-        paint_req=("paint_req", "any"), parts=("part_mark", "size"), pcs=("qty", "sum"),
+        paint_req=("paint_req", "any"), weld_req=("weld_req", "any"),
+        parts=("part_mark", "size"), pcs=("qty", "sum"),
         copy_kg=("weight_kg", "sum"), copies=("asm_qty", "max"))
     u["main"] = (heavy["name"] + " " + heavy["profile"]).reindex(u.index)
     u["total_kg"] = u["copy_kg"] * u["copies"]
@@ -507,21 +516,27 @@ def units_df(asof: str | None = None) -> pd.DataFrame:
                        ).fillna(0).astype(int)
         u[f"last_{s}"] = (last[s].reindex(u.index) if s in last else pd.Series("", index=u.index)
                           ).fillna("")
-    u.loc[~u["paint_req"], "d_paint"] = 0
     for s in STAGES:
-        pv = prev_stage(s, False)
-        prev = u["copies"] if pv is None else u[f"d_{pv}"]
-        if s == "site":
-            prev = u["d_paint"].where(u["paint_req"], u["d_welding"])
-        u[f"av_{s}"] = (prev - u[f"d_{s}"]).clip(lower=0)
-        if s == "paint":
-            u.loc[~u["paint_req"], "av_paint"] = 0
-    full = lambda s: u[f"d_{s}"] >= u["copies"]
+        u.loc[~applies(u, s), f"d_{s}"] = 0
+    for s in STAGES:
+        av = pd.Series(0, index=u.index)
+        for pr in (False, True):
+            for wr in (False, True):
+                m = (u["paint_req"] == pr) & (u["weld_req"] == wr)
+                if not m.any() or s not in route(pr, wr):
+                    continue
+                pv = prev_stage(s, pr, wr)
+                prev = u.loc[m, "copies"] if pv is None else u.loc[m, f"d_{pv}"]
+                av[m] = (prev - u.loc[m, f"d_{s}"]).clip(lower=0)
+        u[f"av_{s}"] = av.astype(int)
+    # a stage the unit doesn't need counts as complete
+    full = lambda s: (u[f"d_{s}"] >= u["copies"]) | ~applies(u, s)
+    wr = u["weld_req"]
     lv = pd.Series(0, index=u.index)
     lv = lv.mask(sum(u[f"d_{s}"] for s in STAGES) > 0, 1)
-    lv = lv.mask(full("fitup"), 2)
-    lv = lv.mask(full("fitup") & full("welding"), 3)
-    lv = lv.mask((lv == 3) & (full("paint") | ~u["paint_req"]), 4)
+    lv = lv.mask(wr & full("fitup"), 2)
+    lv = lv.mask(wr & full("fitup") & full("welding"), 3)
+    lv = lv.mask(full("fitup") & full("welding") & full("paint"), 4)
     lv = lv.mask(full("site"), 5)
     u["level"] = lv
     u["status"] = lv.map(dict(enumerate(LEVELS)))
@@ -529,7 +544,12 @@ def units_df(asof: str | None = None) -> pd.DataFrame:
 
 
 def applies(u: pd.DataFrame, s: str) -> pd.Series:
-    return u["paint_req"] if s == "paint" else pd.Series(True, index=u.index)
+    """Does each row (sub assembly or part) need stage s?"""
+    if s == "paint":
+        return u["paint_req"]
+    if s in ("fitup", "welding"):
+        return u["weld_req"]
+    return pd.Series(True, index=u.index)
 
 
 def group_status(lv: pd.Series) -> str:
@@ -549,8 +569,9 @@ def events(u: pd.DataFrame) -> pd.DataFrame:
 
 def part_frame(u: pd.DataFrame) -> pd.DataFrame:
     """parts carrying their sub assembly's copies + copies done per stage."""
-    cols = UK + ["copies", "paint_req"] + [f"d_{s}" for s in STAGES]
-    p = load_parts().drop(columns=["paint_req"]).merge(u[cols], on=UK, how="inner")
+    cols = UK + ["copies", "paint_req", "weld_req"] + [f"d_{s}" for s in STAGES]
+    p = (load_parts().drop(columns=["paint_req", "weld_req"])
+         .merge(u[cols], on=UK, how="inner"))
     return p
 
 
@@ -559,7 +580,7 @@ def stage_pcts(p: pd.DataFrame, by: list[str]) -> pd.DataFrame:
     t = p.assign(_w=p["weight_kg"] * p["copies"])
     agg = {"Parts": ("weight_kg", "size"), "Weight (kg)": ("_w", "sum")}
     for s in STAGES:
-        ap = t["paint_req"] if s == "paint" else pd.Series(True, index=t.index)
+        ap = applies(t, s)
         t[f"_a_{s}"] = t["_w"].where(ap, 0.0)
         t[f"_d_{s}"] = (t["weight_kg"] * t[f"d_{s}"]).where(ap, 0.0)
         agg[f"_a_{s}"] = (f"_a_{s}", "sum")
@@ -770,9 +791,9 @@ def page_update() -> None:
     u = u[u["in_scope"]]
     u = _filters(u, "up")
     u = u[u[f"av_{s}"] > 0]
-    prereq = {"fitup": "", "welding": " (fit-up done)",
-              "paint": " (welded, painting required)",
-              "site": " (painted, or welded when no painting is needed)"}[s]
+    prereq = {"fitup": " (Welded? = YES)", "welding": " (fit-up done)",
+              "paint": " (Painting status = Yes; welded first unless Welded? = NO)",
+              "site": " (finished every stage it needs)"}[s]
     st.caption(f"Sub assemblies with copies ready for **{cfg['label'].lower()}**{prereq}: "
                f"**{len(u):,}** · {int(u[f'av_{s}'].sum()):,} pieces · "
                f"{(u[f'av_{s}'] * u['copy_kg']).sum():,.1f} kg")
@@ -841,11 +862,11 @@ def _book(s: str, picked: pd.DataFrame, u: pd.DataFrame, d: str, do_no: str | No
           who: str) -> None:
     cfg = STAGES[s]
     ts = _now_ts()
-    paint = u.set_index(["work_order", "assembly_mark", "unit"])["paint_req"]
+    req = u.set_index(UK)[["paint_req", "weld_req"]]
     steps, logs = [], []
     for r in picked.to_dict("records"):
         k = (r["WO"], r["Assembly"], r["Sub assembly"])
-        pv = prev_stage(s, bool(paint.get(k, False)))
+        pv = prev_stage(s, bool(req.loc[k, "paint_req"]), bool(req.loc[k, "weld_req"]))
         prev_sql = (f"(SELECT coalesce(max(asm_qty),1) FROM parts WHERE {_PARTS_UNIT_SQL})"
                     if pv is None else
                     f"(SELECT coalesce(sum(qty),0) FROM progress WHERE {_UNIT_SQL} AND stage = :pv)")
@@ -888,8 +909,9 @@ def _undo_ui(s: str) -> None:
         st.caption("No bookings for this stage yet.")
         return
     u = units_df().set_index(UK)
-    g = g.join(u[["paint_req"] + [f"d_{x}" for x in STAGES]], on=UK)
-    g["next"] = [next_stage(s, bool(pr)) for pr in g["paint_req"].fillna(False)]
+    g = g.join(u[["paint_req", "weld_req"] + [f"d_{x}" for x in STAGES]], on=UK)
+    g["next"] = [next_stage(s, bool(pr), bool(wr)) for pr, wr in
+                 zip(g["paint_req"].fillna(False), g["weld_req"].fillna(True))]
     g["room"] = [r[f"d_{s}"] - (r[f"d_{r['next']}"] if r["next"] else 0)
                  for _, r in g.iterrows()]
     g = g[g["qty"] <= g["room"]].sort_values("id", ascending=False)
@@ -964,8 +986,8 @@ def page_assemblies() -> None:
                         "Copies": x["copies"], "kg / copy": x["copy_kg"].round(2),
                         "Total (kg)": x["total_kg"].round(2), "Status": x["status"]})
     for s, cfg in STAGES.items():
-        det[cfg["label"]] = [f"{d}/{c}" if (s != "paint" or pr) else "—"
-                             for d, c, pr in zip(x[f"d_{s}"], x["copies"], x["paint_req"])]
+        det[cfg["label"]] = [f"{d}/{c}" if ap else "—"
+                             for d, c, ap in zip(x[f"d_{s}"], x["copies"], applies(x, s))]
     st.markdown("**Sub assemblies** (pieces done / pieces to make)")
     show_table(det, f"subassemblies_{pick}")
     st.markdown("**Parts (one copy)**")
