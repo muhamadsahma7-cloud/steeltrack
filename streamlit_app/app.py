@@ -754,8 +754,8 @@ def page_overview() -> None:
             st.caption(f"Last 7 days **{wk / 1000:,.2f} t**" if scope
                        else "No parts need this stage.")
 
-    _overview_today(asof, dated)
     _overview_work_orders(u)
+    _overview_today(asof, dated)
 
     st.subheader("Assembly status")
     stat = u.groupby(["work_order", "assembly_mark"])["level"].apply(group_status)
