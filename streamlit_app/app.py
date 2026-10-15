@@ -821,15 +821,6 @@ def _overview_today(asof: date, dated: pd.DataFrame) -> None:
                       delta_color="off")
     if day.empty:
         st.caption("Nothing booked on this day.")
-    else:
-        with st.expander(f"What was done ({len(day):,} bookings)"):
-            show_table(day.sort_values(["stage", "assembly_mark", "unit"])
-                       [["label", "work_order", "area", "assembly_mark", "unit", "qty", "kg",
-                         "do_no", "done_by"]]
-                       .rename(columns={"label": "Stage", "work_order": "WO", "area": "Area",
-                                        "assembly_mark": "Assembly", "unit": "Sub assembly",
-                                        "qty": "Pieces", "kg": "Weight (kg)", "do_no": "D.O. No.",
-                                        "done_by": "Done by"}), f"day_{a}")
 
 
 def _overview_work_orders(u: pd.DataFrame) -> None:
