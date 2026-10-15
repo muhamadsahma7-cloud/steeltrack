@@ -84,7 +84,8 @@ git push -u origin main
 - Progress is booked as **pieces per sub-assembly**:
   **Fit-up → Welding → Blasting & painting → Send to site (D.O. No.)**.
   Each stage can only take pieces the previous stage has finished.
-- `Welded?` = **NO** (purlins, plain beams, angles) is fitted up but skips welding.
+- `Welded?` = **NO** (purlins, plain beams, angles) is never booked for welding: booking its
+  fit-up fills in welding automatically (same pieces, same date).
   Routes: YES/No: Fit-up → Welding → Site · YES/Yes: Fit-up → Welding → Painting → Site ·
   NO/No: Fit-up → Site · NO/Yes: Fit-up → Painting → Site (Welded? / Painting status).
 - `Painting status` = **Yes** must be painted before site; **No** skips blasting & painting.

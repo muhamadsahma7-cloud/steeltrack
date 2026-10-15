@@ -485,6 +485,27 @@ def route(paint_req: bool, weld_req: bool) -> list[str]:
             + ["site"])
 
 
+def progress_eff() -> pd.DataFrame:
+    """Progress as the app counts it. A sub assembly with Welded? = NO is never
+    booked for welding: it gets an automatic welding booking mirroring each
+    fit-up booking (same pieces, same date), so welding %, daily output and
+    the Excel export include it. Undoing the fit-up removes it too."""
+    g = load_progress()
+    p = load_parts()
+    if g.empty or p.empty:
+        return g
+    w = p.groupby(UK)["weld_req"].any()
+    nw = set(w[~w].index)
+    if not nw:
+        return g
+    is_nw = pd.Series([k in nw for k in zip(g["work_order"], g["assembly_mark"], g["unit"])],
+                      index=g.index)
+    auto = g[is_nw & (g["stage"] == "fitup")].assign(
+        stage="welding", done_by="auto (Welded? = NO)")
+    auto["id"] = -auto["id"]
+    return pd.concat([g[~(is_nw & (g["stage"] == "welding"))], auto], ignore_index=True)
+
+
 def prev_stage(s: str, paint_req: bool, weld_req: bool) -> str | None:
     r = route(paint_req, weld_req)
     return r[r.index(s) - 1] if s in r and r.index(s) > 0 else None
@@ -509,7 +530,7 @@ def units_df(asof: str | None = None) -> pd.DataFrame:
         copy_kg=("weight_kg", "sum"), copies=("asm_qty", "max"))
     u["main"] = (heavy["name"] + " " + heavy["profile"]).reindex(u.index)
     u["total_kg"] = u["copy_kg"] * u["copies"]
-    g = load_progress()
+    g = progress_eff()
     if asof:
         g = g[(g["date"] == "") | (g["date"] <= asof)]
     done = g.groupby(UK + ["stage"])["qty"].sum().unstack("stage")
@@ -534,11 +555,10 @@ def units_df(asof: str | None = None) -> pd.DataFrame:
         u[f"av_{s}"] = av.astype(int)
     # a stage the unit doesn't need counts as complete
     full = lambda s: (u[f"d_{s}"] >= u["copies"]) | ~applies(u, s)
-    wr = u["weld_req"]
     lv = pd.Series(0, index=u.index)
     lv = lv.mask(sum(u[f"d_{s}"] for s in STAGES) > 0, 1)
     lv = lv.mask(full("fitup"), 2)
-    lv = lv.mask(wr & full("fitup") & full("welding"), 3)
+    lv = lv.mask(full("fitup") & full("welding"), 3)
     lv = lv.mask(full("fitup") & full("welding") & full("paint"), 4)
     lv = lv.mask(full("site"), 5)
     u["level"] = lv
@@ -550,8 +570,6 @@ def applies(u: pd.DataFrame, s: str) -> pd.Series:
     """Does each row (sub assembly or part) need stage s?"""
     if s == "paint":
         return u["paint_req"]
-    if s == "welding":
-        return u["weld_req"]
     return pd.Series(True, index=u.index)
 
 
@@ -562,7 +580,7 @@ def group_status(lv: pd.Series) -> str:
 
 def events(u: pd.DataFrame) -> pd.DataFrame:
     """progress bookings with their weight (copies x one-copy weight)."""
-    g = load_progress()
+    g = progress_eff()
     e = g.merge(u[UK + ["copy_kg", "in_scope", "area", "priority"]], on=UK, how="inner")
     e = e[e["in_scope"]]
     e["kg"] = e["qty"] * e["copy_kg"]
@@ -794,7 +812,8 @@ def page_update() -> None:
     u = u[u["in_scope"]]
     u = _filters(u, "up")
     u = u[u[f"av_{s}"] > 0]
-    prereq = {"fitup": "", "welding": " (fit-up done, Welded? = YES)",
+    prereq = {"fitup": "", "welding": " (fit-up done, Welded? = YES; Welded? = NO items get "
+                                     "their welding date from fit-up automatically)",
               "paint": " (Painting status = Yes; fit-up done, and welded unless Welded? = NO)",
               "site": " (finished every stage it needs)"}[s]
     st.caption(f"Sub assemblies with copies ready for **{cfg['label'].lower()}**{prereq}: "
@@ -913,6 +932,8 @@ def _undo_ui(s: str) -> None:
         return
     u = units_df().set_index(UK)
     g = g.join(u[["paint_req", "weld_req"] + [f"d_{x}" for x in STAGES]], on=UK)
+    if s == "welding":                      # Welded? = NO welding is automatic
+        g = g[g["weld_req"].fillna(True).astype(bool)]
     g["next"] = [next_stage(s, bool(pr), bool(wr)) for pr, wr in
                  zip(g["paint_req"].fillna(False), g["weld_req"].fillna(True))]
     g["room"] = [r[f"d_{s}"] - (r[f"d_{r['next']}"] if r["next"] else 0)
@@ -1109,7 +1130,7 @@ def page_reports() -> None:
 
 
 def _export_frame(u: pd.DataFrame) -> pd.DataFrame:
-    g = load_progress()
+    g = progress_eff()
     dos = (g[(g["stage"] == "site") & (g["do_no"] != "")].groupby(UK)["do_no"]
            .agg(lambda s: ", ".join(dict.fromkeys(s))).rename("site_dos"))
     cols = UK + [f"d_{s}" for s in STAGES] + [f"last_{s}" for s in STAGES]
