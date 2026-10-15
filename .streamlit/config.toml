@@ -1,0 +1,15 @@
+# Viewer picks Light / Dark with the sidebar switch. Keep in sync with
+# ../../.streamlit/config.toml (used by Streamlit Cloud, which runs from the repo root).
+
+[theme]
+base = "light"
+font = "sans serif"
+primaryColor = "#2f6feb"
+
+[server]
+headless = true
+runOnSave = true
+maxUploadSize = 50
+
+[browser]
+gatherUsageStats = false
