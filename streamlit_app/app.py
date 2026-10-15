@@ -171,12 +171,14 @@ body:not(:has(.vega-embed)) #vg-tooltip-element{display:none!important}
 .st-stage{font-size:.78rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase;
   margin-bottom:.25rem}
 """
-# stage-coloured metric edges + progress fills: containers keyed sg_<stage>
+# stage-coloured metric edges + progress fills: containers keyed
+# sg_/td_/wo_<stage> (stage cards, today's progress, work order figures)
 _STATIC_CSS += "".join(
-    f'.st-key-sg_{k} [data-testid="stMetric"]{{border-left-color:var(--st_{k})}}'
-    f'.st-key-sg_{k} [data-testid="stProgress"] [role="progressbar"] div:empty{{background:var(--st_{k})}}'
-    f'.st-key-sg_{k} .st-stage{{color:var(--st_{k})}}'
-    for k in ("fitup", "welding", "paint", "site", "scope")
+    f'.st-key-{pre}_{k} [data-testid="stMetric"]{{border-left-color:var(--st_{k})}}'
+    f'.st-key-{pre}_{k} [data-testid="stProgress"] [role="progressbar"] div:empty{{background:var(--st_{k})}}'
+    f'.st-key-{pre}_{k} .st-stage{{color:var(--st_{k})}}'
+    for pre in ("sg", "td", "wo")
+    for k in ("fitup", "welding", "paint", "site", "scope", "hold")
 )
 
 _FORCE_TMPL = """
@@ -712,6 +714,9 @@ def page_overview() -> None:
         k[3].metric("Not NAEC scope", t_(out["total_kg"].sum()),
                     f"{len(out):,} sub assemblies · not counted", delta_color="off")
 
+    _overview_today(asof, dated)
+    _overview_work_orders(u)
+
     st.subheader("Progress by stage")
     week0 = (asof - timedelta(days=6)).isoformat()
     cols = st.columns(4)
@@ -720,7 +725,6 @@ def page_overview() -> None:
         scope = u.loc[ap, "total_kg"].sum()
         dn = (u.loc[ap, f"d_{s}"] * u.loc[ap, "copy_kg"]).sum()
         es = dated[dated["stage"] == s]
-        today_kg = es.loc[es["date"] == a, "kg"].sum()
         wk = es.loc[es["date"] >= week0, "kg"].sum()
         pct = dn / scope * 100 if scope else 0
         with col.container(key=f"sg_{s}"):
@@ -728,8 +732,8 @@ def page_overview() -> None:
             st.metric(f"{pct:.1f}% complete", t_(dn), f"balance {t_(scope - dn)}",
                       delta_color="off")
             st.progress(min(pct / 100, 1.0))
-            st.caption(f"Today **{today_kg:,.0f} kg** · last 7 days **{wk / 1000:,.2f} t**"
-                       if scope else "No parts need this stage.")
+            st.caption(f"Last 7 days **{wk / 1000:,.2f} t**" if scope
+                       else "No parts need this stage.")
 
     st.subheader("Assembly status")
     stat = u.groupby(["work_order", "assembly_mark"])["level"].apply(group_status)
@@ -801,6 +805,76 @@ def page_overview() -> None:
     with t3:
         p = stage_pcts(pf, ["name"]).sort_values("Weight (kg)", ascending=False)
         show_table(p.rename(columns={"name": "Member type"}), "progress_by_member")
+
+
+def _overview_today(asof: date, dated: pd.DataFrame) -> None:
+    """What was booked on the As-of day (today by default), per stage."""
+    a = asof.isoformat()
+    st.subheader("Today's progress" if asof == _today() else f"Progress on {asof:%a %d %b %Y}")
+    day = dated[dated["date"] == a]
+    cols = st.columns(4)
+    for col, (s, cfg) in zip(cols, STAGES.items()):
+        x = day[day["stage"] == s]
+        with col.container(key=f"td_{s}"):
+            st.metric(cfg["label"], f"{x['kg'].sum():,.1f} kg",
+                      f"{int(x['qty'].sum()):,} pcs · {x.groupby(UK).ngroups:,} sub assemblies",
+                      delta_color="off")
+    if day.empty:
+        st.caption("Nothing booked on this day.")
+    else:
+        with st.expander(f"What was done ({len(day):,} bookings)"):
+            show_table(day.sort_values(["stage", "assembly_mark", "unit"])
+                       [["label", "work_order", "area", "assembly_mark", "unit", "qty", "kg",
+                         "do_no", "done_by"]]
+                       .rename(columns={"label": "Stage", "work_order": "WO", "area": "Area",
+                                        "assembly_mark": "Assembly", "unit": "Sub assembly",
+                                        "qty": "Pieces", "kg": "Weight (kg)", "do_no": "D.O. No.",
+                                        "done_by": "Done by"}), f"day_{a}")
+
+
+def _overview_work_orders(u: pd.DataFrame) -> None:
+    """Issued work orders and what is left to fit up / weld. A row with a Work
+    order no counts as issued. Welding backlog = fitted up, not yet welded
+    (Welded? = NO items are left out: their welding follows fit-up)."""
+    st.subheader("Work orders")
+    iss = u[u["work_order"] != ""].copy()
+    nis = u[u["work_order"] == ""]
+    if iss.empty:
+        st.caption("No work order issued yet.")
+        return
+    iss["fit_bal"] = (iss["copies"] - iss["d_fitup"]).clip(lower=0)
+    iss["weld_bal"] = (iss["copies"] - iss["d_welding"]).clip(lower=0)
+    iss["backlog"] = (iss["d_fitup"] - iss["d_welding"]).clip(lower=0).where(iss["weld_req"], 0)
+    for c in ("fit_bal", "weld_bal", "backlog", "d_fitup", "d_welding", "d_site"):
+        iss[f"{c}_kg"] = iss[c] * iss["copy_kg"]
+    sub = f"{t_(iss['total_kg'].sum())} · {int(iss['copies'].sum()):,} pcs"
+    if not nis.empty:
+        sub += f" · not issued {t_(nis['total_kg'].sum())}"
+    k = st.columns(4)
+    for col, key, label, val, d in (
+        (k[0], "wo_scope", "Work orders issued", f"{iss['work_order'].nunique():,}", sub),
+        (k[1], "wo_fitup", "Balance to fit-up", t_(iss["fit_bal_kg"].sum()),
+         f"{int(iss['fit_bal'].sum()):,} pcs"),
+        (k[2], "wo_welding", "Balance to welding", t_(iss["weld_bal_kg"].sum()),
+         f"{int(iss['weld_bal'].sum()):,} pcs"),
+        (k[3], "wo_hold", "Welding backlog", t_(iss["backlog_kg"].sum()),
+         f"{int(iss['backlog'].sum()):,} pcs fitted up, not welded"),
+    ):
+        with col.container(key=key):
+            st.metric(label, val, d, delta_color="off")
+    g = iss.groupby("work_order").agg(
+        area=("area", lambda x: ", ".join(dict.fromkeys(v for v in x if v))),
+        subs=("unit", "size"), pcs=("copies", "sum"), kg=("total_kg", "sum"),
+        fu=("d_fitup_kg", "sum"), fb=("fit_bal_kg", "sum"), wd=("d_welding_kg", "sum"),
+        wb=("weld_bal_kg", "sum"), bl=("backlog_kg", "sum"), si=("d_site_kg", "sum"))
+    g = g.reset_index()
+    for c in ("kg", "fu", "fb", "wd", "wb", "bl", "si"):
+        g[c] = g[c] / 1000
+    show_table(g.rename(columns={
+        "work_order": "WO", "area": "Area", "subs": "Sub assemblies", "pcs": "Pieces",
+        "kg": "Weight (t)", "fu": "Fitted up (t)", "fb": "Balance fit-up (t)",
+        "wd": "Welded (t)", "wb": "Balance welding (t)", "bl": "Welding backlog (t)",
+        "si": "Sent to site (t)"}), "work_orders")
 
 
 # --------------------------------------------------------------- Update
